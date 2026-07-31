@@ -15,8 +15,14 @@ class Settings:
     database_url: str
     artifact_root: Path
     publish_root: Path
+    model_root: Path
     max_upload_bytes: int
     worker_poll_seconds: int
+    transcription_provider: str
+    whisper_model: str
+    whisper_device: str
+    whisper_compute_type: str
+    whisper_cpu_threads: int
     log_level: str
 
     @classmethod
@@ -31,8 +37,14 @@ class Settings:
             ),
             artifact_root=Path(os.getenv("CAMPAIGN_ARTIFACT_ROOT", "./data/artifacts")),
             publish_root=Path(os.getenv("CAMPAIGN_PUBLISH_ROOT", "./data/publish")),
+            model_root=Path(os.getenv("CAMPAIGN_MODEL_ROOT", "./data/models")),
             max_upload_bytes=_integer_environment("CAMPAIGN_MAX_UPLOAD_BYTES", 8 * 1024**3),
             worker_poll_seconds=_integer_environment("CAMPAIGN_WORKER_POLL_SECONDS", 5),
+            transcription_provider=os.getenv("CAMPAIGN_TRANSCRIPTION_PROVIDER", "disabled"),
+            whisper_model=os.getenv("CAMPAIGN_WHISPER_MODEL", "small.en"),
+            whisper_device=os.getenv("CAMPAIGN_WHISPER_DEVICE", "cpu"),
+            whisper_compute_type=os.getenv("CAMPAIGN_WHISPER_COMPUTE_TYPE", "int8"),
+            whisper_cpu_threads=_integer_environment("CAMPAIGN_WHISPER_CPU_THREADS", 4),
             log_level=os.getenv("CAMPAIGN_LOG_LEVEL", "INFO").upper(),
         )
 
@@ -45,8 +57,14 @@ class Settings:
             "database_configured": bool(self.database_url),
             "artifact_root": str(self.artifact_root),
             "publish_root": str(self.publish_root),
+            "model_root": str(self.model_root),
             "max_upload_bytes": self.max_upload_bytes,
             "worker_poll_seconds": self.worker_poll_seconds,
+            "transcription_provider": self.transcription_provider,
+            "whisper_model": self.whisper_model,
+            "whisper_device": self.whisper_device,
+            "whisper_compute_type": self.whisper_compute_type,
+            "whisper_cpu_threads": self.whisper_cpu_threads,
             "log_level": self.log_level,
         }
 

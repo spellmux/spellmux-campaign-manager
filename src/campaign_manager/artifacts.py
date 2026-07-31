@@ -17,6 +17,58 @@ ALLOWED_AUDIO_EXTENSIONS = {".flac", ".m4a", ".mp3", ".mp4", ".ogg", ".opus", ".
 CHUNK_SIZE = 1024 * 1024
 
 
+def ingest_text(
+    database: Session,
+    settings: Settings,
+    game_session: GameSession,
+    user: User,
+    kind: str,
+    content: str,
+    filename: str | None = None,
+) -> Artifact:
+    artifact_id = uuid.uuid4()
+    artifact_kind = "source_transcript" if kind == "transcript" else "source_notes"
+    clean_filename = Path(filename or f"{kind}.md").name[:255]
+    relative_path = (
+        Path(str(game_session.campaign_id))
+        / str(game_session.id)
+        / "source"
+        / f"{artifact_id}.md"
+    )
+    destination = settings.artifact_root / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    encoded = content.encode("utf-8")
+    if len(encoded) > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail="Text source exceeds upload limit")
+    temporary = destination.with_suffix(".md.partial")
+    try:
+        with temporary.open("xb") as output:
+            output.write(encoded)
+        os.replace(temporary, destination)
+        artifact = Artifact(
+            id=artifact_id,
+            session_id=game_session.id,
+            kind=artifact_kind,
+            relative_path=relative_path.as_posix(),
+            original_filename=clean_filename,
+            media_type="text/markdown; charset=utf-8",
+            size_bytes=len(encoded),
+            sha256=hashlib.sha256(encoded).hexdigest(),
+            visibility="gm",
+            created_by_id=user.id,
+        )
+        database.add(artifact)
+        game_session.status = SessionStatus.REVIEW.value
+        database.commit()
+        database.refresh(artifact)
+        return artifact
+    except Exception:
+        database.rollback()
+        temporary.unlink(missing_ok=True)
+        destination.unlink(missing_ok=True)
+        raise
+
+
 def ingest_audio(
     database: Session,
     settings: Settings,

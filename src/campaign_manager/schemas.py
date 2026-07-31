@@ -88,7 +88,21 @@ class ArtifactResponse(BaseModel):
     sha256: str
     visibility: str
     created_at: datetime
-    job: JobResponse
+    job: JobResponse | None = None
+
+
+class TextSourceCreate(BaseModel):
+    kind: str
+    content: str = Field(min_length=1, max_length=20_000_000)
+    filename: str | None = Field(default=None, max_length=255)
+
+    @field_validator("kind")
+    @classmethod
+    def valid_kind(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"transcript", "notes"}:
+            raise ValueError("Text source kind must be transcript or notes")
+        return normalized
 
 
 GUIDE_KINDS = {

@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from campaign_manager import __version__
-from campaign_manager.artifacts import ingest_audio
+from campaign_manager.artifacts import ingest_audio, ingest_text
 from campaign_manager.auth import authenticate, current_user, issue_token, revoke_token
 from campaign_manager.config import Settings
 from campaign_manager.database import database_session
@@ -38,6 +38,7 @@ from campaign_manager.schemas import (
     LoginRequest,
     SessionCreate,
     SessionResponse,
+    TextSourceCreate,
     TokenResponse,
     UserResponse,
 )
@@ -315,6 +316,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             created_at=artifact.created_at,
             job=JobResponse.model_validate(job),
         )
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/text",
+        response_model=ArtifactResponse,
+        status_code=201,
+        tags=["sessions"],
+    )
+    def add_text_source(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        request: TextSourceCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> ArtifactResponse:
+        require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        game_session = database.scalar(
+            select(GameSession).where(
+                GameSession.id == session_id,
+                GameSession.campaign_id == campaign_id,
+            )
+        )
+        if game_session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        artifact = ingest_text(
+            database,
+            resolved,
+            game_session,
+            user,
+            request.kind,
+            request.content,
+            request.filename,
+        )
+        return ArtifactResponse.model_validate(artifact)
 
     @app.get(
         "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/jobs",

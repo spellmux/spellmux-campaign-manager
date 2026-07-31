@@ -10,11 +10,13 @@ fi
 APP_ROOT="${CAMPAIGN_APP_ROOT:-/mnt/user/appdata/campaign-manager}"
 ARTIFACT_ROOT="${CAMPAIGN_ARTIFACT_ROOT:-$APP_ROOT/artifacts}"
 PUBLISH_ROOT="${CAMPAIGN_PUBLISH_ROOT:-$APP_ROOT/publish}"
+MODEL_ROOT="${CAMPAIGN_MODEL_ROOT:-$APP_ROOT/models}"
 DATABASE_ROOT="${CAMPAIGN_DATABASE_ROOT:-$APP_ROOT/postgres}"
 SECRETS_FILE="${CAMPAIGN_SECRETS_FILE:-$APP_ROOT/secrets.env}"
 NETWORK="${CAMPAIGN_NETWORK:-campaign-manager}"
 HTTP_PORT="${CAMPAIGN_HTTP_PORT:-8088}"
 APP_IMAGE="${CAMPAIGN_IMAGE:-campaign-manager:dev}"
+WORKER_IMAGE="${CAMPAIGN_WORKER_IMAGE:-$APP_IMAGE}"
 POSTGRES_IMAGE="${CAMPAIGN_POSTGRES_IMAGE:-postgres:17-alpine}"
 DATABASE_CONTAINER="campaign-manager-database"
 SERVER_CONTAINER="campaign-manager-server"
@@ -41,12 +43,14 @@ Campaign Manager Unraid installation plan
 
 Mode:              $MODE
 Application image: $APP_IMAGE
+Worker image:      $WORKER_IMAGE
 Postgres image:    $POSTGRES_IMAGE
 Docker network:    $NETWORK
 HTTP port:         $HTTP_PORT
 Application root:  $APP_ROOT
 Artifact root:     $ARTIFACT_ROOT
 Publish staging:   $PUBLISH_ROOT
+Model cache:       $MODEL_ROOT
 Database root:     $DATABASE_ROOT
 Secrets file:      $SECRETS_FILE
 Containers:
@@ -70,6 +74,10 @@ preflight() {
   fi
   if ! docker image inspect "$APP_IMAGE" >/dev/null 2>&1; then
     echo "Application image is not available locally: $APP_IMAGE" >&2
+    exit 1
+  fi
+  if ! docker image inspect "$WORKER_IMAGE" >/dev/null 2>&1; then
+    echo "Worker image is not available locally: $WORKER_IMAGE" >&2
     exit 1
   fi
   if port_in_use; then
@@ -131,6 +139,7 @@ finish_installation() {
   local database_password="$1"
   local database_url
 
+  install -d -m 0750 -o 99 -g 100 "$ARTIFACT_ROOT" "$PUBLISH_ROOT" "$MODEL_ROOT"
   wait_for_database
   database_url="postgresql+psycopg://campaign:$database_password@$DATABASE_CONTAINER:5432/campaign"
 
@@ -164,9 +173,16 @@ finish_installation() {
     --env CAMPAIGN_DATABASE_URL="$database_url" \
     --env CAMPAIGN_ARTIFACT_ROOT=/data/artifacts \
     --env CAMPAIGN_PUBLISH_ROOT=/data/publish \
+    --env CAMPAIGN_MODEL_ROOT=/data/models \
+    --env CAMPAIGN_TRANSCRIPTION_PROVIDER=faster-whisper \
+    --env CAMPAIGN_WHISPER_MODEL="${CAMPAIGN_WHISPER_MODEL:-small.en}" \
+    --env CAMPAIGN_WHISPER_DEVICE="${CAMPAIGN_WHISPER_DEVICE:-cpu}" \
+    --env CAMPAIGN_WHISPER_COMPUTE_TYPE="${CAMPAIGN_WHISPER_COMPUTE_TYPE:-int8}" \
+    --env CAMPAIGN_WHISPER_CPU_THREADS="${CAMPAIGN_WHISPER_CPU_THREADS:-4}" \
     --volume "$ARTIFACT_ROOT:/data/artifacts" \
     --volume "$PUBLISH_ROOT:/data/publish" \
-    "$APP_IMAGE" campaign-worker >/dev/null
+    --volume "$MODEL_ROOT:/data/models" \
+    "$WORKER_IMAGE" campaign-worker >/dev/null
 
   echo
   echo "Installation completed."
@@ -176,7 +192,7 @@ finish_installation() {
 }
 
 apply_installation() {
-  install -d -m 0750 -o 99 -g 100 "$APP_ROOT" "$ARTIFACT_ROOT" "$PUBLISH_ROOT"
+  install -d -m 0750 -o 99 -g 100 "$APP_ROOT" "$ARTIFACT_ROOT" "$PUBLISH_ROOT" "$MODEL_ROOT"
   # postgres:alpine drops to its internal postgres account (UID/GID 70).
   # The bind mount itself must therefore be traversable by that account.
   install -d -m 0700 -o 70 -g 70 "$DATABASE_ROOT"

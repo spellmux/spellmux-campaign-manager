@@ -30,3 +30,12 @@ CMD ["pytest", "-q"]
 FROM base AS runtime
 USER 99:100
 CMD ["campaign-server"]
+
+FROM base AS worker
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir ".[transcription]"
+USER 99:100
+CMD ["campaign-worker"]

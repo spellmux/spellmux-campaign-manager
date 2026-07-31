@@ -27,8 +27,14 @@ def configured_client(tmp_path) -> TestClient:
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
         artifact_root=tmp_path / "artifacts",
         publish_root=tmp_path / "publish",
+        model_root=tmp_path / "models",
         max_upload_bytes=10 * 1024 * 1024,
         worker_poll_seconds=1,
+        transcription_provider="disabled",
+        whisper_model="small.en",
+        whisper_device="cpu",
+        whisper_compute_type="int8",
+        whisper_cpu_threads=4,
         log_level="INFO",
     )
     return TestClient(create_app(settings))
@@ -167,3 +173,30 @@ def test_campaign_guide_stores_canonical_vocabulary(tmp_path) -> None:
     assert created.json()["aliases"] == ["Iggwilv", "Natasha"]
     assert listed.json()[0]["canonical_name"] == "Tasha"
 
+
+def test_pasted_transcript_is_private_source_without_diarization_job(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, session_id = create_campaign_and_session(client, headers)
+
+    added = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/text",
+        headers=headers,
+        json={
+            "kind": "transcript",
+            "filename": "old-session.txt",
+            "content": "GM: You arrive at the crossroads.\nTasha: I inspect the archway.",
+        },
+    )
+    jobs = client.get(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/jobs",
+        headers=headers,
+    )
+
+    assert added.status_code == 201
+    assert added.json()["kind"] == "source_transcript"
+    assert added.json()["visibility"] == "gm"
+    assert added.json()["job"] is None
+    assert jobs.json() == []
+    stored = list((tmp_path / "artifacts").rglob("*.md"))
+    assert stored[0].read_text(encoding="utf-8").startswith("GM: You arrive")

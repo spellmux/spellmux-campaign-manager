@@ -1,8 +1,4 @@
-"""Background worker entry point.
-
-The durable job implementation will be added with the persisted session model.
-This process intentionally reports readiness without pretending to process jobs.
-"""
+"""Background worker entry point."""
 
 from __future__ import annotations
 
@@ -13,8 +9,7 @@ import threading
 from campaign_manager.config import Settings
 from campaign_manager.database import configure_database, session_factory
 from campaign_manager.jobs import claim_next_job, complete_job, fail_job
-
-SUPPORTED_JOB_KINDS = {"noop"}
+from campaign_manager.transcription import process_transcription_job
 
 
 def main() -> None:
@@ -23,18 +18,23 @@ def main() -> None:
     logger = logging.getLogger("campaign_manager.worker")
     stopped = threading.Event()
     configure_database(settings.database_url)
+    supported_job_kinds = {"noop"}
+    if settings.transcription_provider == "faster-whisper":
+        supported_job_kinds.add("transcription")
 
     def stop(_signum: int, _frame: object) -> None:
         stopped.set()
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    logger.info("Worker ready; supported job kinds: %s", sorted(SUPPORTED_JOB_KINDS))
+    logger.info("Worker ready; supported job kinds: %s", sorted(supported_job_kinds))
     while not stopped.is_set():
         with session_factory()() as database:
-            job = claim_next_job(database, SUPPORTED_JOB_KINDS)
+            job = claim_next_job(database, supported_job_kinds)
             if job is not None:
                 try:
+                    if job.kind == "transcription":
+                        process_transcription_job(database, settings, job)
                     complete_job(database, job)
                     logger.info("Completed job %s (%s)", job.id, job.kind)
                 except Exception as exc:

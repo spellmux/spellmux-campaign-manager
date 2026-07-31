@@ -12,8 +12,14 @@ def test_health_endpoint(tmp_path) -> None:
         database_url="postgresql://unused",
         artifact_root=tmp_path / "artifacts",
         publish_root=tmp_path / "publish",
+        model_root=tmp_path / "models",
         max_upload_bytes=1024,
         worker_poll_seconds=1,
+        transcription_provider="disabled",
+        whisper_model="small.en",
+        whisper_device="cpu",
+        whisper_compute_type="int8",
+        whisper_cpu_threads=4,
         log_level="INFO",
     )
     client = TestClient(create_app(settings))
