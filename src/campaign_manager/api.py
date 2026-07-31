@@ -3,22 +3,41 @@
 from __future__ import annotations
 
 import re
+import uuid
+from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from campaign_manager import __version__
+from campaign_manager.artifacts import ingest_audio
 from campaign_manager.auth import authenticate, current_user, issue_token, revoke_token
 from campaign_manager.config import Settings
 from campaign_manager.database import database_session
-from campaign_manager.models import Campaign, CampaignMembership, CampaignRole, User
+from campaign_manager.models import (
+    Campaign,
+    CampaignGuideEntry,
+    CampaignMembership,
+    CampaignRole,
+    GameSession,
+    Job,
+    User,
+)
+from campaign_manager.permissions import require_campaign_role
 from campaign_manager.schemas import (
+    ArtifactResponse,
     CampaignCreate,
+    CampaignGuideCreate,
+    CampaignGuideResponse,
     CampaignResponse,
+    JobResponse,
     LoginRequest,
+    SessionCreate,
+    SessionResponse,
     TokenResponse,
     UserResponse,
 )
@@ -47,6 +66,22 @@ def _campaign_response(campaign: Campaign, role: str) -> CampaignResponse:
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings.from_environment()
     app = FastAPI(title="Campaign Manager", version=__version__)
+
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"
+        )
+        return response
+
+    @app.get("/", include_in_schema=False)
+    def index() -> FileResponse:
+        return FileResponse(Path(__file__).parent / "static" / "index.html")
 
     @app.get("/api/v1/health", tags=["system"])
     def health() -> dict[str, object]:
@@ -130,6 +165,182 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail="Campaign slug already exists") from exc
         database.refresh(campaign)
         return _campaign_response(campaign, CampaignRole.OWNER.value)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/guide",
+        response_model=list[CampaignGuideResponse],
+        tags=["campaign-guide"],
+    )
+    def list_campaign_guide(
+        campaign_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[CampaignGuideEntry]:
+        membership = require_campaign_role(database, user, campaign_id)
+        statement = select(CampaignGuideEntry).where(
+            CampaignGuideEntry.campaign_id == campaign_id,
+            CampaignGuideEntry.is_active.is_(True),
+        )
+        if membership.role == CampaignRole.PLAYER.value:
+            statement = statement.where(CampaignGuideEntry.visibility == "player")
+        return list(
+            database.scalars(
+                statement.order_by(CampaignGuideEntry.kind, CampaignGuideEntry.canonical_name)
+            )
+        )
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/guide",
+        response_model=CampaignGuideResponse,
+        status_code=201,
+        tags=["campaign-guide"],
+    )
+    def create_campaign_guide_entry(
+        campaign_id: uuid.UUID,
+        request: CampaignGuideCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> CampaignGuideEntry:
+        require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        entry = CampaignGuideEntry(
+            campaign_id=campaign_id,
+            kind=request.kind,
+            canonical_name=request.canonical_name.strip(),
+            aliases=request.aliases,
+            notes=request.notes.strip(),
+            visibility=request.visibility,
+            created_by_id=user.id,
+        )
+        database.add(entry)
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="A Campaign Guide entry with that kind and name already exists",
+            ) from exc
+        database.refresh(entry)
+        return entry
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions",
+        response_model=list[SessionResponse],
+        tags=["sessions"],
+    )
+    def list_sessions(
+        campaign_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[GameSession]:
+        require_campaign_role(database, user, campaign_id)
+        return list(
+            database.scalars(
+                select(GameSession)
+                .where(GameSession.campaign_id == campaign_id)
+                .order_by(GameSession.session_date.desc(), GameSession.created_at.desc())
+            )
+        )
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions",
+        response_model=SessionResponse,
+        status_code=201,
+        tags=["sessions"],
+    )
+    def create_session(
+        campaign_id: uuid.UUID,
+        request: SessionCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> GameSession:
+        require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        game_session = GameSession(
+            campaign_id=campaign_id,
+            title=request.title.strip(),
+            session_date=request.session_date,
+            created_by_id=user.id,
+        )
+        database.add(game_session)
+        database.commit()
+        database.refresh(game_session)
+        return game_session
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/audio",
+        response_model=ArtifactResponse,
+        status_code=201,
+        tags=["sessions"],
+    )
+    def upload_audio(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        audio: UploadFile = File(),
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> ArtifactResponse:
+        require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        game_session = database.scalar(
+            select(GameSession).where(
+                GameSession.id == session_id,
+                GameSession.campaign_id == campaign_id,
+            )
+        )
+        if game_session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        artifact, job = ingest_audio(database, resolved, game_session, user, audio)
+        return ArtifactResponse(
+            id=artifact.id,
+            kind=artifact.kind,
+            original_filename=artifact.original_filename,
+            media_type=artifact.media_type,
+            size_bytes=artifact.size_bytes,
+            sha256=artifact.sha256,
+            visibility=artifact.visibility,
+            created_at=artifact.created_at,
+            job=JobResponse.model_validate(job),
+        )
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/jobs",
+        response_model=list[JobResponse],
+        tags=["sessions"],
+    )
+    def list_session_jobs(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[Job]:
+        require_campaign_role(database, user, campaign_id)
+        game_session_exists = database.scalar(
+            select(GameSession.id).where(
+                GameSession.id == session_id,
+                GameSession.campaign_id == campaign_id,
+            )
+        )
+        if game_session_exists is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return list(
+            database.scalars(
+                select(Job).where(Job.session_id == session_id).order_by(Job.created_at.desc())
+            )
+        )
 
     return app
 

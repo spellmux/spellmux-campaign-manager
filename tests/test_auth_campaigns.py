@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from campaign_manager.api import create_app
 from campaign_manager.auth import hash_password
+from campaign_manager.config import Settings
 from campaign_manager.database import configure_database, session_factory
 from campaign_manager.models import Base, User
 
@@ -19,7 +20,18 @@ def configured_client(tmp_path) -> TestClient:
             )
         )
         database.commit()
-    return TestClient(create_app())
+    settings = Settings(
+        environment="test",
+        host="127.0.0.1",
+        port=8088,
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        artifact_root=tmp_path / "artifacts",
+        publish_root=tmp_path / "publish",
+        max_upload_bytes=10 * 1024 * 1024,
+        worker_poll_seconds=1,
+        log_level="INFO",
+    )
+    return TestClient(create_app(settings))
 
 
 def login(client: TestClient) -> str:
@@ -91,4 +103,67 @@ def test_readiness_checks_database(tmp_path) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
+
+
+def create_campaign_and_session(client: TestClient, headers: dict[str, str]) -> tuple[str, str]:
+    campaign = client.post(
+        "/api/v1/campaigns",
+        headers=headers,
+        json={"name": "Planebreaker"},
+    ).json()
+    game_session = client.post(
+        f"/api/v1/campaigns/{campaign['id']}/sessions",
+        headers=headers,
+        json={"title": "Arrival at the Crossroads", "session_date": "2026-07-31"},
+    )
+    assert game_session.status_code == 201
+    return campaign["id"], game_session.json()["id"]
+
+
+def test_session_audio_upload_is_private_and_queues_job(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, session_id = create_campaign_and_session(client, headers)
+
+    uploaded = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/audio",
+        headers=headers,
+        files={"audio": ("table-session.m4a", b"local audio bytes", "audio/mp4")},
+    )
+    jobs = client.get(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/jobs",
+        headers=headers,
+    )
+
+    assert uploaded.status_code == 201
+    assert uploaded.json()["visibility"] == "gm"
+    assert uploaded.json()["job"]["kind"] == "transcription"
+    assert uploaded.json()["job"]["status"] == "queued"
+    assert jobs.json()[0]["id"] == uploaded.json()["job"]["id"]
+    stored_files = list((tmp_path / "artifacts").rglob("*.m4a"))
+    assert len(stored_files) == 1
+    assert stored_files[0].read_bytes() == b"local audio bytes"
+
+
+def test_campaign_guide_stores_canonical_vocabulary(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, _session_id = create_campaign_and_session(client, headers)
+
+    created = client.post(
+        f"/api/v1/campaigns/{campaign_id}/guide",
+        headers=headers,
+        json={
+            "kind": "character",
+            "canonical_name": "Tasha",
+            "aliases": ["Iggwilv", "  Natasha  "],
+            "notes": "Use the canonical spelling Tasha.",
+            "visibility": "gm",
+        },
+    )
+    listed = client.get(f"/api/v1/campaigns/{campaign_id}/guide", headers=headers)
+
+    assert created.status_code == 201
+    assert created.json()["aliases"] == ["Iggwilv", "Natasha"]
+    assert listed.json()[0]["canonical_name"] == "Tasha"
 

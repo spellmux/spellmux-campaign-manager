@@ -32,6 +32,8 @@ def test_safe_summary_hides_database_credentials() -> None:
         database_url="postgresql://user:very-secret@database/db",
         artifact_root=Path("artifacts"),
         publish_root=Path("publish"),
+        max_upload_bytes=1024,
+        worker_poll_seconds=1,
         log_level="INFO",
     )
 
@@ -39,4 +41,3 @@ def test_safe_summary_hides_database_credentials() -> None:
 
     assert summary["database_configured"] is True
     assert "very-secret" not in repr(summary)
-

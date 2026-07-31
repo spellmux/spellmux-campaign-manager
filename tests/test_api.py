@@ -12,6 +12,8 @@ def test_health_endpoint(tmp_path) -> None:
         database_url="postgresql://unused",
         artifact_root=tmp_path / "artifacts",
         publish_root=tmp_path / "publish",
+        max_upload_bytes=1024,
+        worker_poll_seconds=1,
         log_level="INFO",
     )
     client = TestClient(create_app(settings))
@@ -21,4 +23,3 @@ def test_health_endpoint(tmp_path) -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
     assert response.json()["environment"] == "test"
-

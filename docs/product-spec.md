@@ -19,10 +19,13 @@ what becomes visible to players or is published externally.
 1. A GM uploads an audio recording to a campaign session.
 2. A background worker normalizes and transcribes the recording locally.
 3. Diarization proposes speaker turns; the GM assigns and corrects identities.
-4. A local language model proposes recaps, scenes, and entity changes.
-5. All proposals begin as GM-only drafts.
-6. The GM approves player-visible content.
-7. Approved content appears in the player portal and may be published through a
+4. The Campaign Guide supplies canonical names, aliases, pronunciations, typed
+   campaign knowledge, and GM coaching.
+5. A local language model proposes recaps, scenes, characters, locations, items,
+   spells, factions, quests, and entity changes.
+6. All proposals begin as GM-only drafts.
+7. The GM approves player-visible content.
+8. Approved content appears in the player portal and may be published through a
    configured adapter such as OtterWiki or generic Git/Markdown.
 
 ## Privacy invariants
@@ -43,7 +46,10 @@ what becomes visible to players or is published externally.
 - Persists background jobs and survives process restarts.
 - Produces a timestamped local transcription.
 - Produces proposed speaker turns and permits correction.
+- Presents representative clips for voice-cluster validation and optional local
+  speaker-profile enrollment.
 - Produces a reviewed transcript artifact.
+- Stores Campaign Guide coaching and typed canonical vocabulary.
 - Generates structured session-note drafts through a local model provider.
 - Separates GM-only and player-approved content.
 - Previews exact Markdown changes before publication.
@@ -57,4 +63,3 @@ what becomes visible to players or is published externally.
 - Real-time recording or transcription
 - Tactical map generation guarantees
 - Unrestricted host or Unraid administration through MCP
-

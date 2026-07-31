@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Campaign Manager</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #11151c; color: #eef2f7; }
+    body { max-width: 1050px; margin: auto; padding: 2rem 1rem 5rem; }
+    h1, h2 { color: #f4c95d; }
+    section { border: 1px solid #354052; border-radius: .75rem; padding: 1rem; margin: 1rem 0; background: #19212c; }
+    form { display: grid; gap: .7rem; margin: .7rem 0; }
+    input, select, textarea, button { font: inherit; padding: .65rem; border-radius: .4rem; border: 1px solid #4b5a70; }
+    input, select, textarea { background: #101620; color: #eef2f7; }
+    button { background: #345995; color: white; cursor: pointer; }
+    button.secondary { background: #3b4658; }
+    .row { display: flex; gap: .7rem; flex-wrap: wrap; align-items: center; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+    .card { border-left: 4px solid #f4c95d; padding: .6rem .8rem; background: #101620; margin: .5rem 0; }
+    .muted { color: #aab5c5; }
+    .error { color: #ff8f8f; white-space: pre-wrap; }
+    .success { color: #8be3a3; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <header class="row">
+    <div><h1>Campaign Manager</h1><div class="muted">Private campaign workspace</div></div>
+    <button id="logout" class="secondary" hidden>Log out</button>
+  </header>
+  <p id="message" role="status"></p>
+
+  <section id="login-panel">
+    <h2>Log in</h2>
+    <form id="login-form">
+      <input id="email" type="email" autocomplete="username" placeholder="Email" required>
+      <input id="password" type="password" autocomplete="current-password" placeholder="Password" required>
+      <button>Log in</button>
+    </form>
+  </section>
+
+  <main id="workspace" hidden>
+    <div class="grid">
+      <section>
+        <h2>Campaigns</h2>
+        <div id="campaigns"></div>
+        <form id="campaign-form">
+          <input id="campaign-name" placeholder="New campaign name" maxlength="160" required>
+          <textarea id="campaign-description" placeholder="Description"></textarea>
+          <button>Create campaign</button>
+        </form>
+      </section>
+
+      <section>
+        <h2>Selected campaign</h2>
+        <select id="campaign-select"><option value="">Choose a campaign</option></select>
+        <h3>Sessions</h3>
+        <div id="sessions"></div>
+        <form id="session-form">
+          <input id="session-title" placeholder="Session title" maxlength="200" required>
+          <input id="session-date" type="date">
+          <button>Create session</button>
+        </form>
+      </section>
+    </div>
+
+    <section>
+      <h2>Upload session audio</h2>
+      <form id="upload-form">
+        <select id="session-select" required><option value="">Choose a session</option></select>
+        <input id="audio" type="file" accept="audio/*,.m4a,.mp3,.mp4,.flac,.ogg,.opus,.wav" required>
+        <button>Store privately and queue transcription</button>
+      </form>
+    </section>
+
+    <section>
+      <h2>Campaign Guide</h2>
+      <p class="muted">Canonical vocabulary and GM coaching for transcription and analysis.</p>
+      <div id="guide"></div>
+      <form id="guide-form">
+        <div class="row">
+          <select id="guide-kind">
+            <option>instruction</option><option>character</option><option>location</option>
+            <option>faction</option><option>item</option><option>spell</option><option>quest</option>
+            <option>creature</option><option>deity</option><option>rule</option>
+            <option>pronunciation</option><option>other</option>
+          </select>
+          <select id="guide-visibility"><option value="gm">GM only</option><option value="player">Players</option></select>
+        </div>
+        <input id="guide-name" placeholder="Canonical name or instruction label" maxlength="200" required>
+        <input id="guide-aliases" placeholder="Aliases, comma separated">
+        <textarea id="guide-notes" placeholder="Description, pronunciation, or coaching"></textarea>
+        <button>Add guide entry</button>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    const state = { token: sessionStorage.getItem("campaignToken"), campaigns: [], campaignId: "", sessions: [] };
+    const byId = id => document.getElementById(id);
+    function message(text, kind = "") { const node = byId("message"); node.textContent = text; node.className = kind; }
+    async function api(path, options = {}) {
+      const headers = new Headers(options.headers || {});
+      if (state.token) headers.set("Authorization", `Bearer ${state.token}`);
+      if (options.body && !(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
+      const response = await fetch(`/api/v1${path}`, { ...options, headers });
+      if (!response.ok) {
+        let detail = `${response.status} ${response.statusText}`;
+        try { detail = (await response.json()).detail || detail; } catch (_) {}
+        throw new Error(detail);
+      }
+      return response.status === 204 ? null : response.json();
+    }
+    function card(title, details) {
+      const node = document.createElement("div"); node.className = "card";
+      const strong = document.createElement("strong"); strong.textContent = title; node.append(strong);
+      if (details) { const small = document.createElement("div"); small.className = "muted"; small.textContent = details; node.append(small); }
+      return node;
+    }
+    async function loadCampaigns() {
+      state.campaigns = await api("/campaigns");
+      byId("campaigns").replaceChildren(...state.campaigns.map(c => card(c.name, c.role)));
+      const select = byId("campaign-select");
+      select.replaceChildren(new Option("Choose a campaign", ""), ...state.campaigns.map(c => new Option(c.name, c.id)));
+      if (state.campaignId && state.campaigns.some(c => c.id === state.campaignId)) select.value = state.campaignId;
+    }
+    async function loadCampaignDetails() {
+      if (!state.campaignId) { byId("sessions").replaceChildren(); byId("guide").replaceChildren(); return; }
+      const [sessions, guide] = await Promise.all([api(`/campaigns/${state.campaignId}/sessions`), api(`/campaigns/${state.campaignId}/guide`)]);
+      state.sessions = sessions;
+      byId("sessions").replaceChildren(...sessions.map(s => card(s.title, `${s.session_date || "No date"} · ${s.status}`)));
+      byId("session-select").replaceChildren(new Option("Choose a session", ""), ...sessions.map(s => new Option(s.title, s.id)));
+      byId("guide").replaceChildren(...guide.map(g => card(`${g.kind}: ${g.canonical_name}`, `${g.aliases.join(", ")} ${g.notes}`.trim())));
+    }
+    async function enterWorkspace() {
+      await api("/auth/me");
+      byId("login-panel").hidden = true; byId("workspace").hidden = false; byId("logout").hidden = false;
+      await loadCampaigns(); await loadCampaignDetails();
+    }
+    byId("login-form").addEventListener("submit", async event => { event.preventDefault(); try {
+      const result = await api("/auth/login", { method: "POST", body: JSON.stringify({ email: byId("email").value, password: byId("password").value }) });
+      state.token = result.access_token; sessionStorage.setItem("campaignToken", state.token); byId("password").value = ""; message("Logged in", "success"); await enterWorkspace();
+    } catch (error) { message(error.message, "error"); }});
+    byId("logout").addEventListener("click", async () => { try { await api("/auth/logout", { method: "POST" }); } catch (_) {}
+      state.token = null; sessionStorage.removeItem("campaignToken"); location.reload();
+    });
+    byId("campaign-form").addEventListener("submit", async event => { event.preventDefault(); try {
+      const campaign = await api("/campaigns", { method: "POST", body: JSON.stringify({ name: byId("campaign-name").value, description: byId("campaign-description").value }) });
+      state.campaignId = campaign.id; byId("campaign-name").value = ""; byId("campaign-description").value = ""; await loadCampaigns(); await loadCampaignDetails(); message("Campaign created", "success");
+    } catch (error) { message(error.message, "error"); }});
+    byId("campaign-select").addEventListener("change", async event => { state.campaignId = event.target.value; try { await loadCampaignDetails(); } catch (error) { message(error.message, "error"); }});
+    byId("session-form").addEventListener("submit", async event => { event.preventDefault(); if (!state.campaignId) return message("Choose a campaign first", "error"); try {
+      await api(`/campaigns/${state.campaignId}/sessions`, { method: "POST", body: JSON.stringify({ title: byId("session-title").value, session_date: byId("session-date").value || null }) });
+      byId("session-title").value = ""; await loadCampaignDetails(); message("Session created", "success");
+    } catch (error) { message(error.message, "error"); }});
+    byId("upload-form").addEventListener("submit", async event => { event.preventDefault(); const sessionId = byId("session-select").value; const file = byId("audio").files[0]; if (!state.campaignId || !sessionId || !file) return; try {
+      const body = new FormData(); body.append("audio", file); message("Uploading…"); const artifact = await api(`/campaigns/${state.campaignId}/sessions/${sessionId}/audio`, { method: "POST", body });
+      byId("audio").value = ""; await loadCampaignDetails(); message(`Stored ${artifact.original_filename}; transcription job queued`, "success");
+    } catch (error) { message(error.message, "error"); }});
+    byId("guide-form").addEventListener("submit", async event => { event.preventDefault(); if (!state.campaignId) return message("Choose a campaign first", "error"); try {
+      await api(`/campaigns/${state.campaignId}/guide`, { method: "POST", body: JSON.stringify({ kind: byId("guide-kind").value, canonical_name: byId("guide-name").value, aliases: byId("guide-aliases").value.split(","), notes: byId("guide-notes").value, visibility: byId("guide-visibility").value }) });
+      byId("guide-name").value = ""; byId("guide-aliases").value = ""; byId("guide-notes").value = ""; await loadCampaignDetails(); message("Campaign Guide updated", "success");
+    } catch (error) { message(error.message, "error"); }});
+    if (state.token) enterWorkspace().catch(() => { sessionStorage.removeItem("campaignToken"); state.token = null; });
+  </script>
+</body>
+</html>

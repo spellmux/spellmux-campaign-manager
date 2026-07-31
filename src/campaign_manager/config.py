@@ -15,6 +15,8 @@ class Settings:
     database_url: str
     artifact_root: Path
     publish_root: Path
+    max_upload_bytes: int
+    worker_poll_seconds: int
     log_level: str
 
     @classmethod
@@ -29,6 +31,8 @@ class Settings:
             ),
             artifact_root=Path(os.getenv("CAMPAIGN_ARTIFACT_ROOT", "./data/artifacts")),
             publish_root=Path(os.getenv("CAMPAIGN_PUBLISH_ROOT", "./data/publish")),
+            max_upload_bytes=_integer_environment("CAMPAIGN_MAX_UPLOAD_BYTES", 8 * 1024**3),
+            worker_poll_seconds=_integer_environment("CAMPAIGN_WORKER_POLL_SECONDS", 5),
             log_level=os.getenv("CAMPAIGN_LOG_LEVEL", "INFO").upper(),
         )
 
@@ -41,6 +45,8 @@ class Settings:
             "database_configured": bool(self.database_url),
             "artifact_root": str(self.artifact_root),
             "publish_root": str(self.publish_root),
+            "max_upload_bytes": self.max_upload_bytes,
+            "worker_poll_seconds": self.worker_poll_seconds,
             "log_level": self.log_level,
         }
 

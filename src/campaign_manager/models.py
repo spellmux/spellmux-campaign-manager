@@ -8,6 +8,7 @@ from enum import Enum
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     Date,
     DateTime,
@@ -109,6 +110,36 @@ class CampaignMembership(Base):
     user: Mapped[User] = relationship()
 
 
+class CampaignGuideEntry(Base):
+    __tablename__ = "campaign_guide_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id",
+            "kind",
+            "canonical_name",
+            name="uq_campaign_guide_kind_name",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(30))
+    canonical_name: Mapped[str] = mapped_column(String(200))
+    aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    visibility: Mapped[str] = mapped_column(String(20), default="gm")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class GameSession(Base):
     __tablename__ = "game_sessions"
 
@@ -125,6 +156,26 @@ class GameSession(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class Artifact(Base):
+    __tablename__ = "artifacts"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(40))
+    relative_path: Mapped[str] = mapped_column(String(500), unique=True)
+    original_filename: Mapped[str] = mapped_column(String(255))
+    media_type: Mapped[str] = mapped_column(String(120))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(String(64))
+    visibility: Mapped[str] = mapped_column(String(20), default="gm")
+    created_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (Index("ix_jobs_status_created_at", "status", "created_at"),)
@@ -132,6 +183,9 @@ class Job(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     session_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=True
+    )
+    artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="CASCADE"), nullable=True
     )
     kind: Mapped[str] = mapped_column(String(40))
     status: Mapped[str] = mapped_column(String(30), default=JobStatus.QUEUED.value)

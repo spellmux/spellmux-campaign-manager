@@ -25,12 +25,17 @@ This repository is an early `0.1` foundation. It currently provides:
 - Argon2 password hashing and opaque bearer-token authentication;
 - administrator bootstrap and campaign-scoped owner/GM/player roles;
 - authenticated campaign creation and listing APIs;
+- session creation and private streamed audio ingestion;
+- durable, selectively claimed background jobs;
+- typed Campaign Guide coaching and canonical vocabulary;
+- a minimal authenticated web workspace;
 - a preview-first, resumable Unraid installer;
 - architecture, privacy, and Unraid deployment decisions.
 
-The job schema is persistent, but the worker does not claim or process jobs yet.
-Transcription and publishing remain intentionally incomplete until their review
-workflow is implemented.
+The worker currently processes only an internal `noop` job type. Audio creates a
+durable queued `transcription` job, but the worker deliberately leaves it untouched
+until a local speech provider and review workflow are implemented. Publishing is
+also intentionally incomplete.
 
 ## Local commands
 
