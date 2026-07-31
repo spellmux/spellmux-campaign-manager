@@ -1,10 +1,14 @@
+import json
+import uuid
+
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from campaign_manager.api import create_app
 from campaign_manager.auth import hash_password
 from campaign_manager.config import Settings
 from campaign_manager.database import configure_database, session_factory
-from campaign_manager.models import Base, User
+from campaign_manager.models import Artifact, Base, GameSession, User
 
 
 def configured_client(tmp_path) -> TestClient:
@@ -150,6 +154,14 @@ def test_session_audio_upload_is_private_and_queues_job(tmp_path) -> None:
     assert len(stored_files) == 1
     assert stored_files[0].read_bytes() == b"local audio bytes"
 
+    duplicate = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/audio",
+        headers=headers,
+        files={"audio": ("other-session.mp3", b"different audio", "audio/mpeg")},
+    )
+    assert duplicate.status_code == 409
+    assert "create another session" in duplicate.json()["detail"]
+
 
 def test_campaign_guide_stores_canonical_vocabulary(tmp_path) -> None:
     client = configured_client(tmp_path)
@@ -200,3 +212,63 @@ def test_pasted_transcript_is_private_source_without_diarization_job(tmp_path) -
     assert jobs.json() == []
     stored = list((tmp_path / "artifacts").rglob("*.md"))
     assert stored[0].read_text(encoding="utf-8").startswith("GM: You arrive")
+
+    artifacts = client.get(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/artifacts",
+        headers=headers,
+    )
+    content = client.get(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/artifacts/{added.json()['id']}/content",
+        headers=headers,
+    )
+    assert artifacts.status_code == 200
+    assert artifacts.json()[0]["original_filename"] == "old-session.txt"
+    assert content.text.startswith("GM: You arrive")
+
+
+def test_transcript_corrections_create_new_version(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, session_id = create_campaign_and_session(client, headers)
+    relative_path = f"{campaign_id}/{session_id}/transcript/raw.json"
+    transcript_path = tmp_path / "artifacts" / relative_path
+    transcript_path.parent.mkdir(parents=True)
+    raw_document = {
+        "schema_version": 1,
+        "provider": "test",
+        "segments": [{"id": 0, "start": 1.0, "end": 2.0, "text": "Kaylin enters."}],
+    }
+    transcript_path.write_text(json.dumps(raw_document), encoding="utf-8")
+    with session_factory()() as database:
+        game_session = database.get(GameSession, uuid.UUID(session_id))
+        user = database.scalar(select(User))
+        artifact = Artifact(
+            session_id=game_session.id,
+            kind="raw_transcript",
+            relative_path=relative_path,
+            original_filename="raw.json",
+            media_type="application/json",
+            size_bytes=transcript_path.stat().st_size,
+            sha256="0" * 64,
+            visibility="gm",
+            created_by_id=user.id,
+        )
+        database.add(artifact)
+        database.commit()
+        artifact_id = artifact.id
+
+    revised = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/transcripts/{artifact_id}/revisions",
+        headers=headers,
+        json={"segments": [{"id": 0, "text": "Caelen enters."}]},
+    )
+    raw_after = json.loads(transcript_path.read_text(encoding="utf-8"))
+    corrected = client.get(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/artifacts/{revised.json()['id']}/content",
+        headers=headers,
+    )
+
+    assert revised.status_code == 201
+    assert revised.json()["kind"] == "corrected_transcript"
+    assert raw_after["segments"][0]["text"] == "Kaylin enters."
+    assert corrected.json()["segments"][0]["text"] == "Caelen enters."

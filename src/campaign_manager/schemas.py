@@ -75,6 +75,9 @@ class JobResponse(BaseModel):
     kind: str
     status: str
     attempts: int
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class ArtifactResponse(BaseModel):
@@ -103,6 +106,15 @@ class TextSourceCreate(BaseModel):
         if normalized not in {"transcript", "notes"}:
             raise ValueError("Text source kind must be transcript or notes")
         return normalized
+
+
+class TranscriptSegmentEdit(BaseModel):
+    id: int = Field(ge=0)
+    text: str = Field(max_length=20_000)
+
+
+class TranscriptRevisionCreate(BaseModel):
+    segments: list[TranscriptSegmentEdit] = Field(max_length=20_000)
 
 
 GUIDE_KINDS = {

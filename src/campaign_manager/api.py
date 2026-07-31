@@ -6,8 +6,8 @@ import re
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
@@ -19,6 +19,7 @@ from campaign_manager.auth import authenticate, current_user, issue_token, revok
 from campaign_manager.config import Settings
 from campaign_manager.database import database_session
 from campaign_manager.models import (
+    Artifact,
     Campaign,
     CampaignGuideEntry,
     CampaignMembership,
@@ -28,6 +29,11 @@ from campaign_manager.models import (
     User,
 )
 from campaign_manager.permissions import require_campaign_role
+from campaign_manager.review import (
+    create_transcript_revision,
+    normalized_audio_clip,
+    read_artifact,
+)
 from campaign_manager.schemas import (
     ArtifactResponse,
     CampaignCreate,
@@ -40,6 +46,7 @@ from campaign_manager.schemas import (
     SessionResponse,
     TextSourceCreate,
     TokenResponse,
+    TranscriptRevisionCreate,
     UserResponse,
 )
 
@@ -76,7 +83,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"
+            "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+            "media-src 'self' blob:; frame-ancestors 'none'"
         )
         return response
 
@@ -304,6 +312,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         if game_session is None:
             raise HTTPException(status_code=404, detail="Session not found")
+        existing_audio = database.scalar(
+            select(Artifact.id).where(
+                Artifact.session_id == session_id,
+                Artifact.kind == "source_audio",
+            )
+        )
+        if existing_audio is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="This session already has source audio; create another session for a different recording",
+            )
         artifact, job = ingest_audio(database, resolved, game_session, user, audio)
         return ArtifactResponse(
             id=artifact.id,
@@ -380,6 +399,136 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 select(Job).where(Job.session_id == session_id).order_by(Job.created_at.desc())
             )
         )
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/artifacts",
+        response_model=list[ArtifactResponse],
+        tags=["review"],
+    )
+    def list_session_artifacts(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[Artifact]:
+        membership = require_campaign_role(database, user, campaign_id)
+        session_exists = database.scalar(
+            select(GameSession.id).where(
+                GameSession.id == session_id,
+                GameSession.campaign_id == campaign_id,
+            )
+        )
+        if session_exists is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        statement = select(Artifact).where(Artifact.session_id == session_id)
+        if membership.role == CampaignRole.PLAYER.value:
+            statement = statement.where(Artifact.visibility == "player")
+        return list(database.scalars(statement.order_by(Artifact.created_at)))
+
+    def review_artifact(
+        database: Session,
+        user: User,
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        artifact_id: uuid.UUID,
+    ) -> Artifact:
+        membership = require_campaign_role(database, user, campaign_id)
+        artifact = database.scalar(
+            select(Artifact)
+            .join(GameSession, GameSession.id == Artifact.session_id)
+            .where(
+                Artifact.id == artifact_id,
+                Artifact.session_id == session_id,
+                GameSession.campaign_id == campaign_id,
+            )
+        )
+        if artifact is None:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        if membership.role == CampaignRole.PLAYER.value and artifact.visibility != "player":
+            raise HTTPException(status_code=403, detail="Artifact is GM-only")
+        return artifact
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/artifacts/{artifact_id}/content",
+        tags=["review"],
+    )
+    def artifact_content(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        artifact_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Response:
+        artifact = review_artifact(database, user, campaign_id, session_id, artifact_id)
+        try:
+            content = read_artifact(resolved, artifact)
+        except ValueError as exc:
+            raise HTTPException(status_code=415, detail=str(exc)) from exc
+        if isinstance(content, str):
+            return PlainTextResponse(content)
+        return JSONResponse(content)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/audio-clip",
+        tags=["review"],
+    )
+    def audio_clip(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        start: float = Query(ge=0),
+        end: float = Query(gt=0),
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Response:
+        require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        normalized = database.scalar(
+            select(Artifact)
+            .join(GameSession, GameSession.id == Artifact.session_id)
+            .where(
+                Artifact.session_id == session_id,
+                Artifact.kind == "normalized_audio",
+                GameSession.campaign_id == campaign_id,
+            )
+            .order_by(Artifact.created_at.desc())
+        )
+        if normalized is None:
+            raise HTTPException(status_code=404, detail="Normalized audio is not available")
+        try:
+            clip = normalized_audio_clip(resolved, normalized, start, end)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return Response(clip, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/transcripts/{artifact_id}/revisions",
+        response_model=ArtifactResponse,
+        status_code=201,
+        tags=["review"],
+    )
+    def revise_transcript(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        artifact_id: uuid.UUID,
+        request: TranscriptRevisionCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Artifact:
+        require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        source = review_artifact(database, user, campaign_id, session_id, artifact_id)
+        try:
+            return create_transcript_revision(database, resolved, source, user, request.segments)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return app
 

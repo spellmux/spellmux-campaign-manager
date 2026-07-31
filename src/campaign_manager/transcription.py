@@ -8,6 +8,7 @@ import os
 import subprocess
 import uuid
 from collections.abc import Callable, Iterable
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -139,15 +140,13 @@ def _normalize_audio(source: Path, destination: Path) -> None:
 
 
 def _faster_whisper_transcriber(settings: Settings) -> Transcribe:
-    from faster_whisper import WhisperModel
-
     settings.model_root.mkdir(parents=True, exist_ok=True)
-    model = WhisperModel(
+    model = _cached_whisper_model(
         settings.whisper_model,
-        device=settings.whisper_device,
-        compute_type=settings.whisper_compute_type,
-        cpu_threads=settings.whisper_cpu_threads,
-        download_root=str(settings.model_root),
+        settings.whisper_device,
+        settings.whisper_compute_type,
+        settings.whisper_cpu_threads,
+        str(settings.model_root),
     )
 
     def transcribe(audio_path: Path, prompt: str) -> dict[str, Any]:
@@ -184,6 +183,25 @@ def _faster_whisper_transcriber(settings: Settings) -> Transcribe:
         }
 
     return transcribe
+
+
+@lru_cache(maxsize=2)
+def _cached_whisper_model(
+    model_name: str,
+    device: str,
+    compute_type: str,
+    cpu_threads: int,
+    download_root: str,
+) -> Any:
+    from faster_whisper import WhisperModel
+
+    return WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+        cpu_threads=cpu_threads,
+        download_root=download_root,
+    )
 
 
 def _write_json_atomic(destination: Path, value: dict[str, Any]) -> None:
