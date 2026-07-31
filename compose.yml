@@ -1,0 +1,55 @@
+services:
+  database:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: campaign
+      POSTGRES_USER: campaign
+      POSTGRES_PASSWORD: ${CAMPAIGN_DATABASE_PASSWORD:?set CAMPAIGN_DATABASE_PASSWORD}
+    volumes:
+      - campaign-database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U campaign -d campaign"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build: .
+    restart: unless-stopped
+    environment: &campaign-environment
+      CAMPAIGN_ENV: ${CAMPAIGN_ENV:-production}
+      CAMPAIGN_HOST: 0.0.0.0
+      CAMPAIGN_PORT: 8088
+      CAMPAIGN_DATABASE_URL: postgresql+psycopg://campaign:${CAMPAIGN_DATABASE_PASSWORD}@database:5432/campaign
+      CAMPAIGN_ARTIFACT_ROOT: /data/artifacts
+      CAMPAIGN_PUBLISH_ROOT: /data/publish
+      CAMPAIGN_LOG_LEVEL: ${CAMPAIGN_LOG_LEVEL:-INFO}
+    ports:
+      - "${CAMPAIGN_HTTP_PORT:-8088}:8088"
+    volumes:
+      - ${CAMPAIGN_ARTIFACT_PATH:-./data/artifacts}:/data/artifacts
+      - ${CAMPAIGN_PUBLISH_PATH:-./data/publish}:/data/publish
+    depends_on:
+      database:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/api/v1/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["campaign-worker"]
+    environment: *campaign-environment
+    volumes:
+      - ${CAMPAIGN_ARTIFACT_PATH:-./data/artifacts}:/data/artifacts
+      - ${CAMPAIGN_PUBLISH_PATH:-./data/publish}:/data/publish
+    depends_on:
+      database:
+        condition: service_healthy
+
+volumes:
+  campaign-database:

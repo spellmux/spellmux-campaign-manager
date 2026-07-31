@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "campaign-manager"
+version = "0.1.0.dev0"
+description = "Local-first TTRPG campaign audio processing and publishing"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "alembic>=1.15,<2",
+  "fastapi>=0.115,<1",
+  "psycopg[binary]>=3.2,<4",
+  "pwdlib[argon2]>=0.3,<1",
+  "sqlalchemy>=2.0,<3",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "httpx>=0.28,<1",
+  "ruff>=0.11,<1",
+]
+
+[project.scripts]
+campaignctl = "campaign_manager.cli:main"
+campaign-server = "campaign_manager.api:main"
+campaign-worker = "campaign_manager.worker:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+ignore = ["B008"] # FastAPI dependencies are intentionally declared as defaults.
+
+[tool.ruff.lint.isort]
+known-first-party = ["campaign_manager"]
