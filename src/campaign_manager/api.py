@@ -45,6 +45,7 @@ from campaign_manager.schemas import (
     AnalysisProposalCreate,
     AnalysisProposalResponse,
     AnalysisProposalUpdate,
+    AnalysisRunCreate,
     ArtifactResponse,
     CampaignCreate,
     CampaignGuideCreate,
@@ -777,6 +778,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 select(Job).where(Job.session_id == session_id).order_by(Job.created_at.desc())
             )
         )
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis",
+        response_model=JobResponse,
+        status_code=202,
+        tags=["analysis-review"],
+    )
+    def queue_session_analysis(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        request: AnalysisRunCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Job:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        sources = list(database.scalars(
+            select(Artifact)
+            .join(GameSession, GameSession.id == Artifact.session_id)
+            .where(
+                Artifact.session_id == session_id,
+                GameSession.campaign_id == campaign_id,
+                Artifact.kind.in_({"corrected_transcript", "raw_transcript", "source_transcript", "source_notes"}),
+            )
+            .order_by(Artifact.created_at.desc())
+        ))
+        if request.source_artifact_id is not None:
+            source = next((item for item in sources if item.id == request.source_artifact_id), None)
+            if source is None:
+                raise HTTPException(status_code=404, detail="Analysis source not found")
+        else:
+            priority = {"corrected_transcript": 0, "raw_transcript": 1, "source_transcript": 2, "source_notes": 3}
+            source = min(sources, key=lambda item: priority[item.kind], default=None)
+        if source is None:
+            raise HTTPException(status_code=409, detail="Add a transcript or notes before analysis")
+        active = database.scalar(select(Job.id).where(
+            Job.session_id == session_id,
+            Job.kind == "analysis",
+            Job.status.in_({"queued", "running"}),
+        ))
+        if active is not None:
+            raise HTTPException(status_code=409, detail="Session analysis is already queued or running")
+        job = Job(
+            session_id=session_id,
+            artifact_id=source.id,
+            kind="analysis",
+            payload={"requested_by_id": str(user.id), "source_artifact_id": str(source.id)},
+        )
+        database.add(job)
+        database.commit()
+        database.refresh(job)
+        return job
 
     @app.post(
         "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/diarization",

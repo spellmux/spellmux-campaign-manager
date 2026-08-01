@@ -28,6 +28,11 @@ class Settings:
     diarization_model: str = "pyannote/speaker-diarization-community-1"
     diarization_device: str = "cpu"
     huggingface_token: str | None = None
+    analysis_provider: str = "disabled"
+    analysis_model: str = "qwen3:4b"
+    analysis_base_url: str = "http://ollama:11434"
+    analysis_timeout_seconds: int = 21_600
+    analysis_max_input_chars: int = 240_000
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -56,6 +61,11 @@ class Settings:
             ),
             diarization_device=os.getenv("CAMPAIGN_DIARIZATION_DEVICE", "cpu"),
             huggingface_token=os.getenv("CAMPAIGN_HUGGINGFACE_TOKEN") or None,
+            analysis_provider=os.getenv("CAMPAIGN_ANALYSIS_PROVIDER", "disabled"),
+            analysis_model=os.getenv("CAMPAIGN_ANALYSIS_MODEL", "qwen3:4b"),
+            analysis_base_url=os.getenv("CAMPAIGN_ANALYSIS_BASE_URL", "http://ollama:11434").rstrip("/"),
+            analysis_timeout_seconds=_integer_environment("CAMPAIGN_ANALYSIS_TIMEOUT_SECONDS", 21_600),
+            analysis_max_input_chars=_integer_environment("CAMPAIGN_ANALYSIS_MAX_INPUT_CHARS", 240_000),
             log_level=os.getenv("CAMPAIGN_LOG_LEVEL", "INFO").upper(),
         )
 
@@ -80,6 +90,11 @@ class Settings:
             "diarization_model": self.diarization_model,
             "diarization_device": self.diarization_device,
             "huggingface_token_configured": bool(self.huggingface_token),
+            "analysis_provider": self.analysis_provider,
+            "analysis_model": self.analysis_model,
+            "analysis_base_url": self.analysis_base_url,
+            "analysis_timeout_seconds": self.analysis_timeout_seconds,
+            "analysis_max_input_chars": self.analysis_max_input_chars,
             "log_level": self.log_level,
         }
 

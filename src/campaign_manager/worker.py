@@ -6,6 +6,7 @@ import logging
 import signal
 import threading
 
+from campaign_manager.analysis import process_analysis_job
 from campaign_manager.config import Settings
 from campaign_manager.database import configure_database, session_factory
 from campaign_manager.diarization import process_diarization_job
@@ -24,6 +25,8 @@ def main() -> None:
         supported_job_kinds.add("transcription")
     if settings.diarization_provider == "pyannote":
         supported_job_kinds.add("diarization")
+    if settings.analysis_provider == "ollama":
+        supported_job_kinds.add("analysis")
 
     def stop(_signum: int, _frame: object) -> None:
         stopped.set()
@@ -40,6 +43,8 @@ def main() -> None:
                         process_transcription_job(database, settings, job)
                     elif job.kind == "diarization":
                         process_diarization_job(database, settings, job)
+                    elif job.kind == "analysis":
+                        process_analysis_job(database, settings, job)
                     complete_job(database, job)
                     logger.info("Completed job %s (%s)", job.id, job.kind)
                 except Exception as exc:

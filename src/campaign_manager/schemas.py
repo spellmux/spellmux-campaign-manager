@@ -278,6 +278,10 @@ class AnalysisProposalResponse(BaseModel):
     reviewed_at: datetime | None
 
 
+class AnalysisRunCreate(BaseModel):
+    source_artifact_id: uuid.UUID | None = None
+
+
 class SpeakerProfileCreate(BaseModel):
     display_name: str = Field(min_length=1, max_length=120)
     notes: str = Field(default="", max_length=20_000)
