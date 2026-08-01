@@ -194,6 +194,90 @@ class CampaignGuideResponse(BaseModel):
     updated_at: datetime
 
 
+ANALYSIS_KINDS = {
+    "session_summary", "character", "location", "item", "spell", "creature",
+    "quest", "faction", "deity", "rule", "important_decision", "unresolved_question",
+}
+
+
+class ProposalEvidence(BaseModel):
+    quote: str = Field(min_length=1, max_length=20_000)
+    artifact_id: uuid.UUID | None = None
+    start_seconds: float | None = Field(default=None, ge=0)
+    end_seconds: float | None = Field(default=None, ge=0)
+
+
+class AnalysisProposalCreate(BaseModel):
+    kind: str
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(default="", max_length=50_000)
+    aliases: list[str] = Field(default_factory=list, max_length=50)
+    evidence: list[ProposalEvidence] = Field(default_factory=list, max_length=50)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    visibility: str = "gm"
+    provider: str = Field(default="manual", max_length=80)
+    model: str = Field(default="", max_length=120)
+    run_metadata: dict[str, object] = Field(default_factory=dict)
+
+    @field_validator("kind")
+    @classmethod
+    def valid_analysis_kind(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in ANALYSIS_KINDS:
+            raise ValueError("Unsupported analysis proposal kind")
+        return normalized
+
+    @field_validator("visibility")
+    @classmethod
+    def valid_analysis_visibility(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"gm", "player"}:
+            raise ValueError("Visibility must be gm or player")
+        return normalized
+
+    @field_validator("aliases")
+    @classmethod
+    def clean_analysis_aliases(cls, value: list[str]) -> list[str]:
+        return list(dict.fromkeys(alias.strip() for alias in value if alias.strip()))
+
+
+class AnalysisProposalUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(default="", max_length=50_000)
+    aliases: list[str] = Field(default_factory=list, max_length=50)
+    visibility: str = "gm"
+
+    @field_validator("visibility")
+    @classmethod
+    def valid_visibility(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"gm", "player"}:
+            raise ValueError("Visibility must be gm or player")
+        return normalized
+
+
+class AnalysisProposalResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    session_id: uuid.UUID
+    kind: str
+    title: str
+    body: str
+    aliases: list[str]
+    evidence: list[ProposalEvidence]
+    confidence: float | None
+    visibility: str
+    status: str
+    provider: str
+    model: str
+    run_metadata: dict[str, object]
+    promoted_guide_entry_id: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+    reviewed_at: datetime | None
+
+
 class SpeakerProfileCreate(BaseModel):
     display_name: str = Field(min_length=1, max_length=120)
     notes: str = Field(default="", max_length=20_000)

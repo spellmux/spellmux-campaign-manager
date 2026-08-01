@@ -158,6 +158,43 @@ class SpeakerProfile(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class AnalysisProposal(Base):
+    """A machine- or human-authored session fact awaiting GM judgment."""
+
+    __tablename__ = "analysis_proposals"
+    __table_args__ = (Index("ix_analysis_proposals_session_status", "session_id", "status"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(40))
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text, default="")
+    aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
+    evidence: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
+    confidence: Mapped[float | None] = mapped_column(nullable=True)
+    visibility: Mapped[str] = mapped_column(String(20), default="gm")
+    status: Mapped[str] = mapped_column(String(20), default="proposed")
+    provider: Mapped[str] = mapped_column(String(80), default="manual")
+    model: Mapped[str] = mapped_column(String(120), default="")
+    run_metadata: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    created_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    reviewed_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    promoted_guide_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("campaign_guide_entries.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class GameSession(Base):
     __tablename__ = "game_sessions"
 

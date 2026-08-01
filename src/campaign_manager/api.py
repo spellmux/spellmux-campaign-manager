@@ -6,12 +6,13 @@ import hashlib
 import os
 import re
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -22,6 +23,7 @@ from campaign_manager.comparison import compare_transcripts
 from campaign_manager.config import Settings
 from campaign_manager.database import database_session
 from campaign_manager.models import (
+    AnalysisProposal,
     Artifact,
     Campaign,
     CampaignGuideEntry,
@@ -40,6 +42,9 @@ from campaign_manager.review import (
     read_artifact,
 )
 from campaign_manager.schemas import (
+    AnalysisProposalCreate,
+    AnalysisProposalResponse,
+    AnalysisProposalUpdate,
     ArtifactResponse,
     CampaignCreate,
     CampaignGuideCreate,
@@ -476,6 +481,187 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.commit()
         database.refresh(game_session)
         return game_session
+
+    def analysis_proposal(
+        database: Session, campaign_id: uuid.UUID, session_id: uuid.UUID, proposal_id: uuid.UUID
+    ) -> AnalysisProposal:
+        proposal = database.scalar(
+            select(AnalysisProposal)
+            .join(GameSession, GameSession.id == AnalysisProposal.session_id)
+            .where(
+                AnalysisProposal.id == proposal_id,
+                AnalysisProposal.session_id == session_id,
+                GameSession.campaign_id == campaign_id,
+            )
+        )
+        if proposal is None:
+            raise HTTPException(status_code=404, detail="Analysis proposal not found")
+        return proposal
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/analysis-proposals",
+        response_model=list[AnalysisProposalResponse],
+        tags=["analysis-review"],
+    )
+    def list_campaign_analysis_proposals(
+        campaign_id: uuid.UUID,
+        proposal_status: str | None = Query(default=None, alias="status"),
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[AnalysisProposal]:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        statement = (
+            select(AnalysisProposal)
+            .join(GameSession, GameSession.id == AnalysisProposal.session_id)
+            .where(GameSession.campaign_id == campaign_id)
+            .order_by(AnalysisProposal.created_at, AnalysisProposal.kind, AnalysisProposal.title)
+        )
+        if proposal_status is not None:
+            if proposal_status not in {"proposed", "approved", "rejected"}:
+                raise HTTPException(status_code=422, detail="Unsupported proposal status")
+            statement = statement.where(AnalysisProposal.status == proposal_status)
+        return list(database.scalars(statement))
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-proposals",
+        response_model=list[AnalysisProposalResponse],
+        tags=["analysis-review"],
+    )
+    def list_analysis_proposals(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        proposal_status: str | None = Query(default=None, alias="status"),
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[AnalysisProposal]:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        statement = (
+            select(AnalysisProposal)
+            .join(GameSession, GameSession.id == AnalysisProposal.session_id)
+            .where(AnalysisProposal.session_id == session_id, GameSession.campaign_id == campaign_id)
+            .order_by(AnalysisProposal.created_at, AnalysisProposal.kind, AnalysisProposal.title)
+        )
+        if proposal_status is not None:
+            if proposal_status not in {"proposed", "approved", "rejected"}:
+                raise HTTPException(status_code=422, detail="Unsupported proposal status")
+            statement = statement.where(AnalysisProposal.status == proposal_status)
+        return list(database.scalars(statement))
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-proposals",
+        response_model=AnalysisProposalResponse,
+        status_code=201,
+        tags=["analysis-review"],
+    )
+    def create_analysis_proposal(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        request: AnalysisProposalCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> AnalysisProposal:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        if database.scalar(select(GameSession.id).where(
+            GameSession.id == session_id, GameSession.campaign_id == campaign_id
+        )) is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        artifact_ids = {item.artifact_id for item in request.evidence if item.artifact_id}
+        if artifact_ids:
+            valid_ids = set(database.scalars(select(Artifact.id).where(
+                Artifact.session_id == session_id, Artifact.id.in_(artifact_ids)
+            )))
+            if valid_ids != artifact_ids:
+                raise HTTPException(status_code=422, detail="Evidence must reference this session's artifacts")
+        proposal = AnalysisProposal(
+            session_id=session_id, kind=request.kind, title=request.title.strip(),
+            body=request.body.strip(), aliases=request.aliases,
+            evidence=[item.model_dump(mode="json") for item in request.evidence],
+            confidence=request.confidence, visibility=request.visibility,
+            provider=request.provider.strip() or "manual", model=request.model.strip(),
+            run_metadata=request.run_metadata, created_by_id=user.id,
+        )
+        database.add(proposal)
+        database.commit()
+        database.refresh(proposal)
+        return proposal
+
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-proposals/{proposal_id}",
+        response_model=AnalysisProposalResponse,
+        tags=["analysis-review"],
+    )
+    def update_analysis_proposal(
+        campaign_id: uuid.UUID, session_id: uuid.UUID, proposal_id: uuid.UUID,
+        request: AnalysisProposalUpdate, user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> AnalysisProposal:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        proposal = analysis_proposal(database, campaign_id, session_id, proposal_id)
+        if proposal.status != "proposed":
+            raise HTTPException(status_code=409, detail="Reviewed proposals cannot be edited")
+        proposal.title = request.title.strip()
+        proposal.body = request.body.strip()
+        proposal.aliases = list(dict.fromkeys(a.strip() for a in request.aliases if a.strip()))
+        proposal.visibility = request.visibility
+        database.commit()
+        database.refresh(proposal)
+        return proposal
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-proposals/{proposal_id}/approve",
+        response_model=AnalysisProposalResponse,
+        tags=["analysis-review"],
+    )
+    def approve_analysis_proposal(
+        campaign_id: uuid.UUID, session_id: uuid.UUID, proposal_id: uuid.UUID,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> AnalysisProposal:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        proposal = analysis_proposal(database, campaign_id, session_id, proposal_id)
+        if proposal.status != "proposed":
+            raise HTTPException(status_code=409, detail="Proposal was already reviewed")
+        guide_kinds = {"character", "location", "item", "spell", "creature", "quest", "faction", "deity", "rule"}
+        if proposal.kind in guide_kinds:
+            entry = database.scalar(select(CampaignGuideEntry).where(
+                CampaignGuideEntry.campaign_id == campaign_id,
+                CampaignGuideEntry.kind == proposal.kind,
+                func.lower(CampaignGuideEntry.canonical_name) == proposal.title.casefold(),
+            ))
+            if entry is None:
+                entry = CampaignGuideEntry(
+                    campaign_id=campaign_id, kind=proposal.kind,
+                    canonical_name=proposal.title, aliases=proposal.aliases,
+                    notes=proposal.body, visibility=proposal.visibility, created_by_id=user.id,
+                )
+                database.add(entry)
+                database.flush()
+            proposal.promoted_guide_entry_id = entry.id
+        proposal.status = "approved"
+        proposal.reviewed_by_id = user.id
+        proposal.reviewed_at = datetime.now(UTC)
+        database.commit()
+        database.refresh(proposal)
+        return proposal
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-proposals/{proposal_id}/reject",
+        response_model=AnalysisProposalResponse,
+        tags=["analysis-review"],
+    )
+    def reject_analysis_proposal(
+        campaign_id: uuid.UUID, session_id: uuid.UUID, proposal_id: uuid.UUID,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> AnalysisProposal:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        proposal = analysis_proposal(database, campaign_id, session_id, proposal_id)
+        if proposal.status != "proposed":
+            raise HTTPException(status_code=409, detail="Proposal was already reviewed")
+        proposal.status = "rejected"
+        proposal.reviewed_by_id = user.id
+        proposal.reviewed_at = datetime.now(UTC)
+        database.commit()
+        database.refresh(proposal)
+        return proposal
 
     @app.post(
         "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/audio",
