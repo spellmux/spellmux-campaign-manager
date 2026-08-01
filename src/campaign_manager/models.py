@@ -166,6 +166,7 @@ class GameSession(Base):
         ForeignKey("campaigns.id", ondelete="CASCADE"), index=True
     )
     title: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")
     session_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     status: Mapped[str] = mapped_column(String(30), default=SessionStatus.CREATED.value)
     created_by_id: Mapped[uuid.UUID] = mapped_column(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import uuid
 from pathlib import Path
@@ -16,6 +18,7 @@ from sqlalchemy.orm import Session
 from campaign_manager import __version__
 from campaign_manager.artifacts import ingest_audio, ingest_text
 from campaign_manager.auth import authenticate, current_user, issue_token, revoke_token
+from campaign_manager.comparison import compare_transcripts
 from campaign_manager.config import Settings
 from campaign_manager.database import database_session
 from campaign_manager.models import (
@@ -41,16 +44,20 @@ from campaign_manager.schemas import (
     CampaignCreate,
     CampaignGuideCreate,
     CampaignGuideResponse,
+    CampaignGuideUpdate,
     CampaignResponse,
     JobResponse,
     LoginRequest,
     SessionCreate,
     SessionResponse,
+    SessionUpdate,
     SpeakerProfileCreate,
     SpeakerProfileResponse,
+    SpeakerProfileUpdate,
     SpeakerReviewCreate,
     SpeakerReviewResponse,
     TextSourceCreate,
+    TextSourceUpdate,
     TokenResponse,
     TranscriptRevisionCreate,
     UserResponse,
@@ -243,6 +250,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.refresh(entry)
         return entry
 
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}/guide/{entry_id}",
+        response_model=CampaignGuideResponse,
+        tags=["campaign-guide"],
+    )
+    def update_campaign_guide_entry(
+        campaign_id: uuid.UUID,
+        entry_id: uuid.UUID,
+        request: CampaignGuideUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> CampaignGuideEntry:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        entry = database.scalar(select(CampaignGuideEntry).where(
+            CampaignGuideEntry.id == entry_id,
+            CampaignGuideEntry.campaign_id == campaign_id,
+        ))
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Campaign Guide entry not found")
+        entry.kind = request.kind
+        entry.canonical_name = request.canonical_name.strip()
+        entry.aliases = request.aliases
+        entry.notes = request.notes.strip()
+        entry.visibility = request.visibility
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="Campaign Guide name already exists") from exc
+        database.refresh(entry)
+        return entry
+
+    @app.delete("/api/v1/campaigns/{campaign_id}/guide/{entry_id}", status_code=204)
+    def delete_campaign_guide_entry(
+        campaign_id: uuid.UUID,
+        entry_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> None:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        entry = database.scalar(select(CampaignGuideEntry).where(
+            CampaignGuideEntry.id == entry_id,
+            CampaignGuideEntry.campaign_id == campaign_id,
+        ))
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Campaign Guide entry not found")
+        database.delete(entry)
+        database.commit()
+
     @app.get(
         "/api/v1/campaigns/{campaign_id}/speakers",
         response_model=list[SpeakerProfileResponse],
@@ -300,6 +356,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.refresh(profile)
         return profile
 
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}/speakers/{profile_id}",
+        response_model=SpeakerProfileResponse,
+        tags=["speaker-review"],
+    )
+    def update_speaker_profile(
+        campaign_id: uuid.UUID,
+        profile_id: uuid.UUID,
+        request: SpeakerProfileUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> SpeakerProfile:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        profile = database.scalar(select(SpeakerProfile).where(
+            SpeakerProfile.id == profile_id,
+            SpeakerProfile.campaign_id == campaign_id,
+        ))
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Speaker not found")
+        profile.display_name = request.display_name.strip()
+        profile.notes = request.notes.strip()
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="Speaker name already exists") from exc
+        database.refresh(profile)
+        return profile
+
+    @app.delete("/api/v1/campaigns/{campaign_id}/speakers/{profile_id}", status_code=204)
+    def delete_speaker_profile(
+        campaign_id: uuid.UUID,
+        profile_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> None:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        profile = database.scalar(select(SpeakerProfile).where(
+            SpeakerProfile.id == profile_id,
+            SpeakerProfile.campaign_id == campaign_id,
+        ))
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Speaker not found")
+        database.delete(profile)
+        database.commit()
+
     @app.get(
         "/api/v1/campaigns/{campaign_id}/sessions",
         response_model=list[SessionResponse],
@@ -341,9 +443,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             campaign_id=campaign_id,
             title=request.title.strip(),
             session_date=request.session_date,
+            description=request.description.strip(),
             created_by_id=user.id,
         )
         database.add(game_session)
+        database.commit()
+        database.refresh(game_session)
+        return game_session
+
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}",
+        response_model=SessionResponse,
+        tags=["sessions"],
+    )
+    def update_session(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        request: SessionUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> GameSession:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        game_session = database.scalar(select(GameSession).where(
+            GameSession.id == session_id,
+            GameSession.campaign_id == campaign_id,
+        ))
+        if game_session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        game_session.title = request.title.strip()
+        game_session.session_date = request.session_date
+        game_session.description = request.description.strip()
         database.commit()
         database.refresh(game_session)
         return game_session
@@ -705,6 +834,99 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if isinstance(content, str):
             return PlainTextResponse(content)
         return JSONResponse(content)
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/comparisons/{source_id}",
+        tags=["review"],
+    )
+    def compare_transcript_source(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        source_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> dict[str, object]:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        source = review_artifact(database, user, campaign_id, session_id, source_id)
+        if source.kind != "source_transcript":
+            raise HTTPException(status_code=422, detail="Comparison source must be a transcript")
+        native = database.scalar(
+            select(Artifact)
+            .where(
+                Artifact.session_id == session_id,
+                Artifact.kind.in_(["raw_transcript", "corrected_transcript"]),
+            )
+            .order_by(Artifact.created_at.desc())
+        )
+        if native is None:
+            raise HTTPException(status_code=409, detail="Native transcript is not available")
+        native_content = read_artifact(resolved, native)
+        source_content = read_artifact(resolved, source)
+        if not isinstance(native_content, dict) or not isinstance(source_content, str):
+            raise HTTPException(status_code=422, detail="Transcript format is not comparable")
+        result = compare_transcripts(native_content.get("segments", []), source_content)
+        result["native_artifact_id"] = str(native.id)
+        result["source_artifact_id"] = str(source.id)
+        return result
+
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/artifacts/{artifact_id}",
+        response_model=ArtifactResponse,
+        tags=["sources"],
+    )
+    def update_text_source(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        artifact_id: uuid.UUID,
+        request: TextSourceUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Artifact:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        artifact = review_artifact(database, user, campaign_id, session_id, artifact_id)
+        if artifact.kind not in {"source_transcript", "source_notes"}:
+            raise HTTPException(status_code=409, detail="Only uploaded text sources are editable")
+        root = resolved.artifact_root.resolve()
+        path = (root / artifact.relative_path).resolve()
+        if not path.is_relative_to(root):
+            raise HTTPException(status_code=422, detail="Artifact path escapes storage")
+        encoded = request.content.encode("utf-8")
+        temporary = path.with_suffix(f"{path.suffix}.partial")
+        try:
+            temporary.write_bytes(encoded)
+            os.replace(temporary, path)
+            artifact.original_filename = Path(request.filename).name
+            artifact.size_bytes = len(encoded)
+            artifact.sha256 = hashlib.sha256(encoded).hexdigest()
+            database.commit()
+            database.refresh(artifact)
+            return artifact
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @app.delete(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/artifacts/{artifact_id}",
+        status_code=204,
+        tags=["sources"],
+    )
+    def delete_source(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        artifact_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> None:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        artifact = review_artifact(database, user, campaign_id, session_id, artifact_id)
+        if artifact.kind not in {"source_transcript", "source_notes"}:
+            raise HTTPException(status_code=409, detail="Only uploaded text sources are deletable")
+        root = resolved.artifact_root.resolve()
+        path = (root / artifact.relative_path).resolve()
+        if not path.is_relative_to(root):
+            raise HTTPException(status_code=422, detail="Artifact path escapes storage")
+        database.delete(artifact)
+        database.commit()
+        path.unlink(missing_ok=True)
 
     @app.get(
         "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/audio-clip",

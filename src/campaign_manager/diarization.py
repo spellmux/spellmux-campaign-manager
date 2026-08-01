@@ -68,6 +68,12 @@ def process_diarization_job(
     if source is None or game_session is None or source.kind != "normalized_audio":
         raise ValueError("Normalized audio for diarization is not available")
     source_path = _contained_path(settings.artifact_root, source.relative_path)
+    source_id = source.id
+    created_by_id = source.created_by_id
+    campaign_id = game_session.campaign_id
+    session_id = game_session.id
+    # Do not retain relation locks during hours-long model inference.
+    database.commit()
     turns = [
         {"start": round(start, 3), "end": round(end, 3), "speaker": speaker}
         for start, end, speaker in (diarize or _pyannote_diarizer(settings))(source_path)
@@ -79,7 +85,7 @@ def process_diarization_job(
         "schema_version": 1,
         "provider": settings.diarization_provider,
         "model": settings.diarization_model,
-        "source_artifact_id": str(source.id),
+        "source_artifact_id": str(source_id),
         "turns": turns,
         "clusters": [
             {"label": label, "representative_clips": clips}
@@ -87,8 +93,8 @@ def process_diarization_job(
         ],
     }
     relative = (
-        Path(str(game_session.campaign_id))
-        / str(game_session.id)
+        Path(str(campaign_id))
+        / str(session_id)
         / "diarization"
         / f"{job.id}.json"
     )
@@ -102,7 +108,7 @@ def process_diarization_job(
         database.add(
             Artifact(
                 id=uuid.uuid4(),
-                session_id=game_session.id,
+                session_id=session_id,
                 kind="diarization",
                 relative_path=relative.as_posix(),
                 original_filename=destination.name,
@@ -110,7 +116,7 @@ def process_diarization_job(
                 size_bytes=len(encoded),
                 sha256=hashlib.sha256(encoded).hexdigest(),
                 visibility="gm",
-                created_by_id=source.created_by_id,
+                created_by_id=created_by_id,
             )
         )
         database.commit()

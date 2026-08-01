@@ -55,6 +55,13 @@ class CampaignResponse(BaseModel):
 class SessionCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     session_date: date | None = None
+    description: str = Field(default="", max_length=20_000)
+
+
+class SessionUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    session_date: date | None = None
+    description: str = Field(default="", max_length=20_000)
 
 
 class SessionResponse(BaseModel):
@@ -64,6 +71,7 @@ class SessionResponse(BaseModel):
     campaign_id: uuid.UUID
     title: str
     session_date: date | None
+    description: str
     status: str
     created_at: datetime
 
@@ -106,6 +114,11 @@ class TextSourceCreate(BaseModel):
         if normalized not in {"transcript", "notes"}:
             raise ValueError("Text source kind must be transcript or notes")
         return normalized
+
+
+class TextSourceUpdate(BaseModel):
+    content: str = Field(min_length=1, max_length=20_000_000)
+    filename: str = Field(min_length=1, max_length=255)
 
 
 class TranscriptSegmentEdit(BaseModel):
@@ -162,6 +175,10 @@ class CampaignGuideCreate(BaseModel):
         return list(dict.fromkeys(alias.strip() for alias in value if alias.strip()))
 
 
+class CampaignGuideUpdate(CampaignGuideCreate):
+    pass
+
+
 class CampaignGuideResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -180,6 +197,10 @@ class CampaignGuideResponse(BaseModel):
 class SpeakerProfileCreate(BaseModel):
     display_name: str = Field(min_length=1, max_length=120)
     notes: str = Field(default="", max_length=20_000)
+
+
+class SpeakerProfileUpdate(SpeakerProfileCreate):
+    pass
 
 
 class SpeakerProfileResponse(BaseModel):
