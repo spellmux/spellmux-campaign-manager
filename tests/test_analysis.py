@@ -114,6 +114,15 @@ def test_prompt_respects_input_limit(tmp_path) -> None:
     assert 0 < len(included) < 50
 
 
+def test_prompt_includes_resolved_speaker_attribution(tmp_path) -> None:
+    session = GameSession(title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
+    prompt, _ = build_analysis_prompt(
+        session, [], [{"start": 12.0, "end": 15.0, "speaker_name": "Rob", "text": "I open the door."}], 2_000,
+    )
+
+    assert "Rob: I open the door." in prompt
+
+
 def test_analysis_status_is_disabled_by_default(tmp_path) -> None:
     status = ollama_status(replace(_settings(tmp_path), analysis_provider="disabled"))
     assert status == {"configured": False, "ready": False, "model": "qwen3:4b", "models": []}

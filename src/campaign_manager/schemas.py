@@ -345,7 +345,10 @@ class SpeakerReviewCreate(BaseModel):
     @classmethod
     def valid_disposition(cls, value: str) -> str:
         normalized = value.strip().casefold()
-        if normalized not in {"confirmed", "uncertain", "crosstalk", "noise"}:
+        if normalized not in {
+            "confirmed", "uncertain", "crosstalk", "noise",
+            "music", "background_music", "featured_song",
+        }:
             raise ValueError("Unsupported speaker review disposition")
         return normalized
 

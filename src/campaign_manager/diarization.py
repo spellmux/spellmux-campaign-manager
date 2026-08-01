@@ -16,10 +16,100 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from campaign_manager.config import Settings
-from campaign_manager.models import Artifact, GameSession, Job
+from campaign_manager.models import Artifact, GameSession, Job, SpeakerReview
 from campaign_manager.transcription import _contained_path
 
 Diarize = Callable[[Path], Iterable[tuple[float, float, str]]]
+
+MUSIC_DISPOSITIONS = {"music", "background_music", "featured_song"}
+
+
+def cluster_resolutions(reviews: Iterable[SpeakerReview]) -> dict[str, dict[str, Any]]:
+    """Resolve reviewed session-local clusters to people or non-speech labels."""
+    grouped: dict[str, list[SpeakerReview]] = defaultdict(list)
+    for review in reviews:
+        grouped[review.cluster_label].append(review)
+    resolved: dict[str, dict[str, Any]] = {}
+    for label, items in grouped.items():
+        dispositions = {item.disposition for item in items}
+        music = dispositions & MUSIC_DISPOSITIONS
+        profiles = {
+            item.speaker_profile_id: item.speaker_profile.display_name
+            for item in items
+            if item.disposition == "confirmed"
+            and item.speaker_profile_id is not None
+            and item.speaker_profile is not None
+        }
+        if len(music) == 1 and dispositions <= MUSIC_DISPOSITIONS:
+            disposition = next(iter(music))
+            resolved[label] = {
+                "status": "reviewed", "disposition": disposition,
+                "display_name": disposition.replace("_", " ").title(),
+            }
+        elif len(profiles) == 1 and dispositions == {"confirmed"}:
+            profile_id, display_name = next(iter(profiles.items()))
+            resolved[label] = {
+                "status": "reviewed", "disposition": "confirmed",
+                "speaker_profile_id": str(profile_id), "display_name": display_name,
+            }
+        else:
+            resolved[label] = {
+                "status": "needs_attention", "disposition": "mixed",
+                "display_name": "Needs attention",
+            }
+    return resolved
+
+
+def attribute_transcript_segments(
+    segments: Iterable[dict[str, Any]],
+    turns: Iterable[dict[str, Any]],
+    resolutions: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach the greatest-overlap diarization cluster and reviewed identity."""
+    diarization_turns = sorted(turns, key=lambda turn: float(turn["start"]))
+    attributed: list[dict[str, Any]] = []
+    turn_index = 0
+    for original in segments:
+        segment = dict(original)
+        start, end = segment.get("start"), segment.get("end")
+        if start is None or end is None:
+            attributed.append(segment)
+            continue
+        start_value, end_value = float(start), float(end)
+        while (
+            turn_index < len(diarization_turns)
+            and float(diarization_turns[turn_index]["end"]) <= start_value
+        ):
+            turn_index += 1
+        candidates: list[tuple[float, dict[str, Any]]] = []
+        candidate_index = turn_index
+        while (
+            candidate_index < len(diarization_turns)
+            and float(diarization_turns[candidate_index]["start"]) < end_value
+        ):
+            candidate = diarization_turns[candidate_index]
+            candidates.append((
+                max(
+                    0.0,
+                    min(end_value, float(candidate["end"]))
+                    - max(start_value, float(candidate["start"])),
+                ),
+                candidate,
+            ))
+            candidate_index += 1
+        overlap, turn = max(candidates, key=lambda item: item[0], default=(0.0, None))
+        if turn is not None and overlap > 0:
+            label = str(turn["speaker"])
+            segment["speaker"] = label
+            resolution = resolutions.get(label)
+            if resolution:
+                segment["speaker_status"] = resolution["status"]
+                segment["speaker_disposition"] = resolution["disposition"]
+                segment["speaker_name"] = resolution["display_name"]
+                if resolution.get("speaker_profile_id"):
+                    segment["speaker_profile_id"] = resolution["speaker_profile_id"]
+        attributed.append(segment)
+    return attributed
 
 
 def representative_clips(

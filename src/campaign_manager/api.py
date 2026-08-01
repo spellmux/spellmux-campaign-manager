@@ -24,6 +24,7 @@ from campaign_manager.auth import authenticate, current_user, issue_token, revok
 from campaign_manager.comparison import compare_transcripts
 from campaign_manager.config import Settings
 from campaign_manager.database import database_session
+from campaign_manager.diarization import attribute_transcript_segments, cluster_resolutions
 from campaign_manager.models import (
     AnalysisProposal,
     Artifact,
@@ -1158,6 +1159,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         review.speaker_profile = profile
         return speaker_review_response(review)
 
+    @app.delete(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/speaker-reviews/{cluster_label}",
+        status_code=204,
+        tags=["speaker-review"],
+    )
+    def reopen_speaker_cluster(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        cluster_label: str,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> None:
+        require_campaign_role(
+            database, user, campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        reviews = list(database.scalars(
+            select(SpeakerReview)
+            .join(GameSession, GameSession.id == SpeakerReview.session_id)
+            .where(
+                SpeakerReview.session_id == session_id,
+                GameSession.campaign_id == campaign_id,
+                SpeakerReview.cluster_label == cluster_label,
+            )
+        ))
+        if not reviews:
+            raise HTTPException(status_code=404, detail="Reviewed cluster not found")
+        for review in reviews:
+            database.delete(review)
+        database.commit()
+
     @app.get(
         "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/artifacts",
         response_model=list[ArtifactResponse],
@@ -1224,6 +1256,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=415, detail=str(exc)) from exc
         if isinstance(content, str):
             return PlainTextResponse(content)
+        if artifact.kind in {"raw_transcript", "corrected_transcript"} and isinstance(
+            content.get("segments"), list
+        ):
+            diarization = database.scalar(select(Artifact).where(
+                Artifact.session_id == session_id,
+                Artifact.kind == "diarization",
+            ).order_by(Artifact.created_at.desc()))
+            if diarization is not None:
+                diarization_content = read_artifact(resolved, diarization)
+                reviews = list(database.scalars(select(SpeakerReview).where(
+                    SpeakerReview.session_id == session_id,
+                )))
+                content = dict(content)
+                content["segments"] = attribute_transcript_segments(
+                    content["segments"], diarization_content.get("turns", []),
+                    cluster_resolutions(reviews),
+                )
         return JSONResponse(content)
 
     @app.get(

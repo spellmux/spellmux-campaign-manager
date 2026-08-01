@@ -323,6 +323,38 @@ def test_gm_can_validate_speaker_clip_and_approve_reference(tmp_path) -> None:
     assert "confirmed speaker" in invalid.json()["detail"]
 
 
+def test_gm_can_classify_music_and_reopen_cluster(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, session_id = create_campaign_and_session(client, headers)
+
+    reviewed = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/speaker-reviews",
+        headers=headers,
+        json={
+            "cluster_label": "SPEAKER_04",
+            "start_seconds": 120,
+            "end_seconds": 135,
+            "disposition": "featured_song",
+            "notes": "Player-created recap song",
+        },
+    )
+    reopened = client.delete(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/speaker-reviews/SPEAKER_04",
+        headers=headers,
+    )
+    listed = client.get(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/speaker-reviews",
+        headers=headers,
+    )
+
+    assert reviewed.status_code == 201
+    assert reviewed.json()["disposition"] == "featured_song"
+    assert reviewed.json()["speaker_profile_id"] is None
+    assert reopened.status_code == 204
+    assert listed.json() == []
+
+
 def test_gm_can_queue_diarization_after_normalized_audio_exists(tmp_path) -> None:
     client = configured_client(tmp_path)
     headers = {"Authorization": f"Bearer {login(client)}"}

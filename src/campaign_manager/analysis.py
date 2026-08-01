@@ -15,12 +15,14 @@ from sqlalchemy.orm import Session
 
 from campaign_manager.comparison import parse_timed_text
 from campaign_manager.config import Settings
+from campaign_manager.diarization import attribute_transcript_segments, cluster_resolutions
 from campaign_manager.models import (
     AnalysisProposal,
     Artifact,
     CampaignGuideEntry,
     GameSession,
     Job,
+    SpeakerReview,
     User,
 )
 from campaign_manager.review import read_artifact
@@ -95,6 +97,20 @@ def process_analysis_job(
         CampaignGuideEntry.is_active.is_(True),
     ).order_by(CampaignGuideEntry.kind, CampaignGuideEntry.canonical_name)))
     segments = _source_segments(read_artifact(settings, source))
+    diarization = database.scalar(select(Artifact).where(
+        Artifact.session_id == game_session.id,
+        Artifact.kind == "diarization",
+    ).order_by(Artifact.created_at.desc()))
+    if diarization is not None and any(segment.get("start") is not None for segment in segments):
+        diarization_document = read_artifact(settings, diarization)
+        reviews = list(database.scalars(select(SpeakerReview).where(
+            SpeakerReview.session_id == game_session.id,
+        )))
+        segments = attribute_transcript_segments(
+            segments,
+            diarization_document.get("turns", []),
+            cluster_resolutions(reviews),
+        )
     prompt, included = build_analysis_prompt(game_session, guide, segments, settings.analysis_max_input_chars)
     result, response_metadata = (analyze or ollama_analyzer(settings))(
         prompt, settings.analysis_model, AnalysisResult.model_json_schema()
@@ -172,7 +188,9 @@ Source segments:
         timing = ""
         if segment.get("start") is not None:
             timing = f" {segment.get('start'):.2f}-{segment.get('end', segment.get('start')):.2f}s"
-        line = f"[{index}{timing}] {str(segment.get('text', '')).strip()}"
+        speaker = segment.get("speaker_name") or segment.get("speaker")
+        attribution = f" {speaker}:" if speaker else ""
+        line = f"[{index}{timing}]{attribution} {str(segment.get('text', '')).strip()}"
         if len(line) + 1 > remaining:
             break
         lines.append(line)
