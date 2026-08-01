@@ -82,9 +82,34 @@ class JobResponse(BaseModel):
     id: uuid.UUID
     kind: str
     status: str
+    priority: int
+    cancel_requested: bool
     attempts: int
     error: str | None
     created_at: datetime
+    updated_at: datetime
+
+
+class QueueJobResponse(JobResponse):
+    session_id: uuid.UUID | None
+    session_title: str | None
+    campaign_id: uuid.UUID | None
+    campaign_name: str | None
+
+
+class JobPriorityUpdate(BaseModel):
+    priority: int = Field(ge=-100, le=100)
+
+
+class ProcessingControlUpdate(BaseModel):
+    paused: bool
+
+
+class ProcessingControlResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    kind: str
+    paused: bool
     updated_at: datetime
 
 

@@ -34,6 +34,7 @@ from campaign_manager.models import (
     CampaignRole,
     GameSession,
     Job,
+    ProcessingControl,
     SessionPublication,
     SpeakerProfile,
     SpeakerReview,
@@ -62,12 +63,16 @@ from campaign_manager.schemas import (
     CampaignGuideResponse,
     CampaignGuideUpdate,
     CampaignResponse,
+    JobPriorityUpdate,
     JobResponse,
     LoginRequest,
+    ProcessingControlResponse,
+    ProcessingControlUpdate,
     PublicationCreate,
     PublicationPublish,
     PublicationResponse,
     PublicationUpdate,
+    QueueJobResponse,
     SessionCreate,
     SessionResponse,
     SessionUpdate,
@@ -932,6 +937,186 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 select(Job).where(Job.session_id == session_id).order_by(Job.created_at.desc())
             )
         )
+
+    def manageable_job(
+        database: Session, user: User, job_id: uuid.UUID
+    ) -> tuple[Job, GameSession | None]:
+        row = database.execute(
+            select(Job, GameSession)
+            .outerjoin(GameSession, GameSession.id == Job.session_id)
+            .where(Job.id == job_id)
+        ).one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        job, game_session = row
+        if not user.is_instance_admin:
+            if game_session is None:
+                raise HTTPException(status_code=403, detail="Instance administrator required")
+            require_campaign_role(database, user, game_session.campaign_id, {"owner", "gm"})
+        return job, game_session
+
+    @app.get("/api/v1/jobs", response_model=list[QueueJobResponse], tags=["processing"])
+    def list_queue_jobs(
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[QueueJobResponse]:
+        statement = (
+            select(Job, GameSession, Campaign)
+            .outerjoin(GameSession, GameSession.id == Job.session_id)
+            .outerjoin(Campaign, Campaign.id == GameSession.campaign_id)
+            .order_by(Job.status, Job.priority.desc(), Job.created_at)
+            .limit(500)
+        )
+        if not user.is_instance_admin:
+            campaign_ids = list(database.scalars(select(CampaignMembership.campaign_id).where(
+                CampaignMembership.user_id == user.id,
+            )))
+            if not campaign_ids:
+                return []
+            statement = statement.where(GameSession.campaign_id.in_(campaign_ids))
+        rows = database.execute(statement).all()
+        return [QueueJobResponse(
+            id=job.id, kind=job.kind, status=job.status, priority=job.priority,
+            cancel_requested=job.cancel_requested, attempts=job.attempts, error=job.error,
+            created_at=job.created_at, updated_at=job.updated_at,
+            session_id=game_session.id if game_session else None,
+            session_title=game_session.title if game_session else None,
+            campaign_id=campaign.id if campaign else None,
+            campaign_name=campaign.name if campaign else None,
+        ) for job, game_session, campaign in rows]
+
+    @app.put(
+        "/api/v1/jobs/{job_id}/priority",
+        response_model=JobResponse,
+        tags=["processing"],
+    )
+    def update_job_priority(
+        job_id: uuid.UUID,
+        request: JobPriorityUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Job:
+        job, _ = manageable_job(database, user, job_id)
+        if job.status != "queued":
+            raise HTTPException(status_code=409, detail="Only queued jobs can be reprioritized")
+        job.priority = request.priority
+        job.updated_at = datetime.now(UTC)
+        database.commit()
+        database.refresh(job)
+        return job
+
+    @app.post(
+        "/api/v1/jobs/{job_id}/cancel",
+        response_model=JobResponse,
+        tags=["processing"],
+    )
+    def cancel_job(
+        job_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Job:
+        job, _ = manageable_job(database, user, job_id)
+        if job.status not in {"queued", "running"}:
+            raise HTTPException(status_code=409, detail="Only active jobs can be cancelled")
+        job.cancel_requested = True
+        if job.status == "queued":
+            job.status = "cancelled"
+        job.updated_at = datetime.now(UTC)
+        database.commit()
+        database.refresh(job)
+        return job
+
+    @app.get(
+        "/api/v1/processing-controls",
+        response_model=list[ProcessingControlResponse],
+        tags=["processing"],
+    )
+    def list_processing_controls(
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[ProcessingControl]:
+        return list(database.scalars(
+            select(ProcessingControl)
+            .where(ProcessingControl.kind.not_like("\\_\\_%", escape="\\"))
+            .order_by(ProcessingControl.kind)
+        ))
+
+    @app.get("/api/v1/processing-status", tags=["processing"])
+    def processing_status(
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> dict[str, object]:
+        del user
+        counts = database.execute(
+            select(Job.kind, Job.status, func.count(Job.id))
+            .where(Job.status.in_({"queued", "running"}))
+            .group_by(Job.kind, Job.status)
+        ).all()
+        memory_available_mb = None
+        try:
+            memory_line = next(
+                line for line in Path("/proc/meminfo").read_text().splitlines()
+                if line.startswith("MemAvailable:")
+            )
+            memory_available_mb = round(int(memory_line.split()[1]) / 1024)
+        except (OSError, StopIteration, ValueError):
+            pass
+        return {
+            "load_average": [round(value, 2) for value in os.getloadavg()],
+            "memory_available_mb": memory_available_mb,
+            "active": [
+                {"kind": kind, "status": status_value, "count": count}
+                for kind, status_value, count in counts
+            ],
+        }
+
+    def set_processing_control(
+        database: Session, user: User, kind: str, paused: bool
+    ) -> ProcessingControl:
+        if not user.is_instance_admin:
+            raise HTTPException(status_code=403, detail="Instance administrator required")
+        supported = {"transcription", "diarization", "analysis", "image_generation"}
+        if kind not in supported:
+            raise HTTPException(status_code=404, detail="Processing control not found")
+        control = database.get(ProcessingControl, kind)
+        if control is None:
+            control = ProcessingControl(kind=kind)
+            database.add(control)
+        control.paused = paused
+        control.updated_by_id = user.id
+        control.updated_at = datetime.now(UTC)
+        database.commit()
+        database.refresh(control)
+        return control
+
+    @app.put(
+        "/api/v1/processing-controls/{kind}",
+        response_model=ProcessingControlResponse,
+        tags=["processing"],
+    )
+    def update_processing_control(
+        kind: str,
+        request: ProcessingControlUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> ProcessingControl:
+        return set_processing_control(database, user, kind, request.paused)
+
+    @app.put(
+        "/api/v1/processing-controls/actions/game-session-mode",
+        response_model=list[ProcessingControlResponse],
+        tags=["processing"],
+    )
+    def game_session_mode(
+        request: ProcessingControlUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[ProcessingControl]:
+        controls = [
+            set_processing_control(database, user, kind, request.paused)
+            for kind in ("transcription", "diarization", "analysis", "image_generation")
+        ]
+        return controls
 
     @app.post(
         "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis",

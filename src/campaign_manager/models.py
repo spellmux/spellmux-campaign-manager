@@ -302,9 +302,24 @@ class Job(Base):
     kind: Mapped[str] = mapped_column(String(40))
     status: Mapped[str] = mapped_column(String(30), default=JobStatus.QUEUED.value)
     payload: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class ProcessingControl(Base):
+    __tablename__ = "processing_controls"
+
+    kind: Mapped[str] = mapped_column(String(40), primary_key=True)
+    paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )

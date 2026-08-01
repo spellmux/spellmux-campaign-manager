@@ -8,7 +8,7 @@ from campaign_manager.api import create_app
 from campaign_manager.auth import hash_password
 from campaign_manager.config import Settings
 from campaign_manager.database import configure_database, session_factory
-from campaign_manager.models import Artifact, Base, GameSession, User
+from campaign_manager.models import Artifact, Base, GameSession, Job, ProcessingControl, User
 
 
 def configured_client(tmp_path) -> TestClient:
@@ -353,6 +353,37 @@ def test_gm_can_classify_music_and_reopen_cluster(tmp_path) -> None:
     assert reviewed.json()["speaker_profile_id"] is None
     assert reopened.status_code == 204
     assert listed.json() == []
+
+
+def test_admin_can_prioritize_cancel_and_pause_processing(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, session_id = create_campaign_and_session(client, headers)
+    with session_factory()() as database:
+        job = Job(session_id=uuid.UUID(session_id), kind="analysis", status="queued", payload={})
+        database.add(job)
+        database.add(ProcessingControl(kind="analysis", paused=False))
+        database.commit()
+        job_id = str(job.id)
+
+    prioritized = client.put(
+        f"/api/v1/jobs/{job_id}/priority", headers=headers, json={"priority": 100}
+    )
+    paused = client.put(
+        "/api/v1/processing-controls/analysis", headers=headers, json={"paused": True}
+    )
+    queue = client.get("/api/v1/jobs", headers=headers)
+    cancelled = client.post(f"/api/v1/jobs/{job_id}/cancel", headers=headers)
+
+    assert prioritized.status_code == 200
+    assert prioritized.json()["priority"] == 100
+    assert paused.status_code == 200
+    assert paused.json()["paused"] is True
+    assert queue.status_code == 200
+    assert queue.json()[0]["campaign_id"] == campaign_id
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["cancel_requested"] is True
 
 
 def test_gm_can_queue_diarization_after_normalized_audio_exists(tmp_path) -> None:
