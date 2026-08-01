@@ -24,6 +24,10 @@ class Settings:
     whisper_compute_type: str
     whisper_cpu_threads: int
     log_level: str
+    diarization_provider: str = "disabled"
+    diarization_model: str = "pyannote/speaker-diarization-community-1"
+    diarization_device: str = "cpu"
+    huggingface_token: str | None = None
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -45,6 +49,13 @@ class Settings:
             whisper_device=os.getenv("CAMPAIGN_WHISPER_DEVICE", "cpu"),
             whisper_compute_type=os.getenv("CAMPAIGN_WHISPER_COMPUTE_TYPE", "int8"),
             whisper_cpu_threads=_integer_environment("CAMPAIGN_WHISPER_CPU_THREADS", 4),
+            diarization_provider=os.getenv("CAMPAIGN_DIARIZATION_PROVIDER", "disabled"),
+            diarization_model=os.getenv(
+                "CAMPAIGN_DIARIZATION_MODEL",
+                "pyannote/speaker-diarization-community-1",
+            ),
+            diarization_device=os.getenv("CAMPAIGN_DIARIZATION_DEVICE", "cpu"),
+            huggingface_token=os.getenv("CAMPAIGN_HUGGINGFACE_TOKEN") or None,
             log_level=os.getenv("CAMPAIGN_LOG_LEVEL", "INFO").upper(),
         )
 
@@ -65,6 +76,10 @@ class Settings:
             "whisper_device": self.whisper_device,
             "whisper_compute_type": self.whisper_compute_type,
             "whisper_cpu_threads": self.whisper_cpu_threads,
+            "diarization_provider": self.diarization_provider,
+            "diarization_model": self.diarization_model,
+            "diarization_device": self.diarization_device,
+            "huggingface_token_configured": bool(self.huggingface_token),
             "log_level": self.log_level,
         }
 

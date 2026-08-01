@@ -39,3 +39,13 @@ RUN apt-get update \
     && python -m pip install --no-cache-dir ".[transcription]"
 USER 99:100
 CMD ["campaign-worker"]
+
+FROM base AS diarization-worker
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu \
+    && python -m pip install --no-cache-dir ".[diarization]"
+USER 99:100
+CMD ["campaign-worker"]

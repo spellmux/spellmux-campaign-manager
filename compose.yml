@@ -51,5 +51,26 @@ services:
       database:
         condition: service_healthy
 
+  diarization-worker:
+    build:
+      context: .
+      target: diarization-worker
+    restart: unless-stopped
+    command: ["campaign-worker"]
+    environment:
+      <<: *campaign-environment
+      CAMPAIGN_TRANSCRIPTION_PROVIDER: disabled
+      CAMPAIGN_DIARIZATION_PROVIDER: pyannote
+      CAMPAIGN_DIARIZATION_MODEL: pyannote/speaker-diarization-community-1
+      CAMPAIGN_DIARIZATION_DEVICE: cpu
+      CAMPAIGN_HUGGINGFACE_TOKEN: ${CAMPAIGN_HUGGINGFACE_TOKEN:-}
+      CAMPAIGN_MODEL_ROOT: /data/models
+    volumes:
+      - ${CAMPAIGN_ARTIFACT_PATH:-./data/artifacts}:/data/artifacts
+      - ${CAMPAIGN_MODEL_PATH:-./data/models}:/data/models
+    depends_on:
+      database:
+        condition: service_healthy
+
 volumes:
   campaign-database:

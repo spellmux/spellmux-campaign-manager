@@ -17,6 +17,10 @@ def test_settings_defaults(monkeypatch) -> None:
         "CAMPAIGN_WHISPER_DEVICE",
         "CAMPAIGN_WHISPER_COMPUTE_TYPE",
         "CAMPAIGN_WHISPER_CPU_THREADS",
+        "CAMPAIGN_DIARIZATION_PROVIDER",
+        "CAMPAIGN_DIARIZATION_MODEL",
+        "CAMPAIGN_DIARIZATION_DEVICE",
+        "CAMPAIGN_HUGGINGFACE_TOKEN",
         "CAMPAIGN_LOG_LEVEL",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -29,6 +33,8 @@ def test_settings_defaults(monkeypatch) -> None:
     assert settings.artifact_root == Path("./data/artifacts")
     assert settings.model_root == Path("./data/models")
     assert settings.transcription_provider == "disabled"
+    assert settings.diarization_provider == "disabled"
+    assert settings.huggingface_token is None
     assert settings.log_level == "INFO"
 
 

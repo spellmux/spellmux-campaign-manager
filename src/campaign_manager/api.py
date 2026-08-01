@@ -463,6 +463,68 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         )
 
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/diarization",
+        response_model=JobResponse,
+        status_code=202,
+        tags=["speaker-review"],
+    )
+    def queue_diarization(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Job:
+        require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        normalized = database.scalar(
+            select(Artifact)
+            .join(GameSession, GameSession.id == Artifact.session_id)
+            .where(
+                Artifact.session_id == session_id,
+                Artifact.kind == "normalized_audio",
+                GameSession.campaign_id == campaign_id,
+            )
+            .order_by(Artifact.created_at.desc())
+        )
+        if normalized is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Transcription must finish before diarization can be queued",
+            )
+        existing_artifact = database.scalar(
+            select(Artifact.id).where(
+                Artifact.session_id == session_id,
+                Artifact.kind == "diarization",
+            )
+        )
+        if existing_artifact is not None:
+            raise HTTPException(status_code=409, detail="This session is already diarized")
+        existing_job = database.scalar(
+            select(Job.id).where(
+                Job.session_id == session_id,
+                Job.kind == "diarization",
+                Job.status.in_(["queued", "running"]),
+            )
+        )
+        if existing_job is not None:
+            raise HTTPException(status_code=409, detail="Diarization is already queued")
+        job = Job(
+            session_id=session_id,
+            artifact_id=normalized.id,
+            kind="diarization",
+            status="queued",
+            payload={"normalized_audio_artifact_id": str(normalized.id)},
+        )
+        database.add(job)
+        database.commit()
+        database.refresh(job)
+        return job
+
     def speaker_review_response(review: SpeakerReview) -> SpeakerReviewResponse:
         return SpeakerReviewResponse(
             id=review.id,

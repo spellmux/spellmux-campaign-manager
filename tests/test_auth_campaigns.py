@@ -321,3 +321,43 @@ def test_gm_can_validate_speaker_clip_and_approve_reference(tmp_path) -> None:
     )
     assert invalid.status_code == 422
     assert "confirmed speaker" in invalid.json()["detail"]
+
+
+def test_gm_can_queue_diarization_after_normalized_audio_exists(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, session_id = create_campaign_and_session(client, headers)
+    relative_path = f"{campaign_id}/{session_id}/normalized/source.wav"
+    audio_path = tmp_path / "artifacts" / relative_path
+    audio_path.parent.mkdir(parents=True)
+    audio_path.write_bytes(b"RIFF test")
+    with session_factory()() as database:
+        user = database.scalar(select(User))
+        database.add(
+            Artifact(
+                session_id=uuid.UUID(session_id),
+                kind="normalized_audio",
+                relative_path=relative_path,
+                original_filename="source.wav",
+                media_type="audio/wav",
+                size_bytes=audio_path.stat().st_size,
+                sha256="1" * 64,
+                visibility="gm",
+                created_by_id=user.id,
+            )
+        )
+        database.commit()
+
+    queued = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/diarization",
+        headers=headers,
+    )
+    duplicate = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/diarization",
+        headers=headers,
+    )
+
+    assert queued.status_code == 202
+    assert queued.json()["kind"] == "diarization"
+    assert queued.json()["status"] == "queued"
+    assert duplicate.status_code == 409
