@@ -34,6 +34,7 @@ class Settings:
     analysis_timeout_seconds: int = 21_600
     analysis_max_input_chars: int = 240_000
     analysis_context_tokens: int = 65_536
+    otterwiki_repository_path: Path | None = None
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -68,6 +69,9 @@ class Settings:
             analysis_timeout_seconds=_integer_environment("CAMPAIGN_ANALYSIS_TIMEOUT_SECONDS", 21_600),
             analysis_max_input_chars=_integer_environment("CAMPAIGN_ANALYSIS_MAX_INPUT_CHARS", 240_000),
             analysis_context_tokens=_integer_environment("CAMPAIGN_ANALYSIS_CONTEXT_TOKENS", 65_536),
+            otterwiki_repository_path=(
+                Path(value) if (value := os.getenv("CAMPAIGN_OTTERWIKI_REPOSITORY_PATH")) else None
+            ),
             log_level=os.getenv("CAMPAIGN_LOG_LEVEL", "INFO").upper(),
         )
 
@@ -98,6 +102,7 @@ class Settings:
             "analysis_timeout_seconds": self.analysis_timeout_seconds,
             "analysis_max_input_chars": self.analysis_max_input_chars,
             "analysis_context_tokens": self.analysis_context_tokens,
+            "otterwiki_publishing_configured": self.otterwiki_repository_path is not None,
             "log_level": self.log_level,
         }
 

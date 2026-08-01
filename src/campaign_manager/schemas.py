@@ -282,6 +282,37 @@ class AnalysisRunCreate(BaseModel):
     source_artifact_id: uuid.UUID | None = None
 
 
+class PublicationCreate(BaseModel):
+    target_path: str | None = Field(default=None, max_length=500)
+
+
+class PublicationUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1, max_length=2_000_000)
+    target_path: str = Field(min_length=1, max_length=500)
+
+
+class PublicationPublish(BaseModel):
+    confirm_overwrite: bool = False
+
+
+class PublicationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    session_id: uuid.UUID
+    revision: int
+    title: str
+    content: str
+    target_path: str
+    source_proposal_ids: list[str]
+    status: str
+    published_commit: str | None
+    created_at: datetime
+    updated_at: datetime
+    published_at: datetime | None
+
+
 class SpeakerProfileCreate(BaseModel):
     display_name: str = Field(min_length=1, max_length=120)
     notes: str = Field(default="", max_length=20_000)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import subprocess
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,11 +33,18 @@ from campaign_manager.models import (
     CampaignRole,
     GameSession,
     Job,
+    SessionPublication,
     SpeakerProfile,
     SpeakerReview,
     User,
 )
 from campaign_manager.permissions import require_campaign_role
+from campaign_manager.publishing import (
+    default_target_path,
+    publish_to_otterwiki,
+    render_player_draft,
+    validate_target_path,
+)
 from campaign_manager.review import (
     create_transcript_revision,
     normalized_audio_clip,
@@ -55,6 +63,10 @@ from campaign_manager.schemas import (
     CampaignResponse,
     JobResponse,
     LoginRequest,
+    PublicationCreate,
+    PublicationPublish,
+    PublicationResponse,
+    PublicationUpdate,
     SessionCreate,
     SessionResponse,
     SessionUpdate,
@@ -669,6 +681,137 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.commit()
         database.refresh(proposal)
         return proposal
+
+    def publication_record(
+        database: Session, campaign_id: uuid.UUID, session_id: uuid.UUID, publication_id: uuid.UUID
+    ) -> SessionPublication:
+        publication = database.scalar(
+            select(SessionPublication)
+            .join(GameSession, GameSession.id == SessionPublication.session_id)
+            .where(
+                SessionPublication.id == publication_id,
+                SessionPublication.session_id == session_id,
+                GameSession.campaign_id == campaign_id,
+            )
+        )
+        if publication is None:
+            raise HTTPException(status_code=404, detail="Publication draft not found")
+        return publication
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/publications",
+        response_model=list[PublicationResponse], tags=["publishing"],
+    )
+    def list_publications(
+        campaign_id: uuid.UUID, session_id: uuid.UUID,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> list[SessionPublication]:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        if database.scalar(select(GameSession.id).where(
+            GameSession.id == session_id, GameSession.campaign_id == campaign_id
+        )) is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return list(database.scalars(select(SessionPublication).where(
+            SessionPublication.session_id == session_id
+        ).order_by(SessionPublication.revision.desc())))
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/publications",
+        response_model=PublicationResponse, status_code=201, tags=["publishing"],
+    )
+    def create_publication(
+        campaign_id: uuid.UUID, session_id: uuid.UUID, request: PublicationCreate,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> SessionPublication:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        game_session = database.scalar(select(GameSession).where(
+            GameSession.id == session_id, GameSession.campaign_id == campaign_id
+        ))
+        if game_session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        proposals = list(database.scalars(select(AnalysisProposal).where(
+            AnalysisProposal.session_id == session_id,
+            AnalysisProposal.status == "approved",
+            AnalysisProposal.visibility == "player",
+        ).order_by(AnalysisProposal.created_at)))
+        if not proposals:
+            raise HTTPException(status_code=409, detail="Approve at least one player-visible finding first")
+        target = request.target_path or default_target_path(game_session)
+        try:
+            target = validate_target_path(target).as_posix()
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        revision = (database.scalar(select(func.max(SessionPublication.revision)).where(
+            SessionPublication.session_id == session_id
+        )) or 0) + 1
+        publication = SessionPublication(
+            session_id=session_id, revision=revision, title=game_session.title,
+            content=render_player_draft(game_session, proposals), target_path=target,
+            source_proposal_ids=[str(item.id) for item in proposals], created_by_id=user.id,
+        )
+        database.add(publication)
+        database.commit()
+        database.refresh(publication)
+        return publication
+
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/publications/{publication_id}",
+        response_model=PublicationResponse, tags=["publishing"],
+    )
+    def update_publication(
+        campaign_id: uuid.UUID, session_id: uuid.UUID, publication_id: uuid.UUID,
+        request: PublicationUpdate, user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> SessionPublication:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        publication = publication_record(database, campaign_id, session_id, publication_id)
+        if publication.status != "draft":
+            raise HTTPException(status_code=409, detail="Published revisions are immutable; generate a new draft")
+        try:
+            publication.target_path = validate_target_path(request.target_path).as_posix()
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        publication.title = request.title.strip()
+        publication.content = request.content
+        database.commit()
+        database.refresh(publication)
+        return publication
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/publications/{publication_id}/publish",
+        response_model=PublicationResponse, tags=["publishing"],
+    )
+    def publish_publication(
+        campaign_id: uuid.UUID, session_id: uuid.UUID, publication_id: uuid.UUID,
+        request: PublicationPublish, user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> SessionPublication:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        publication = publication_record(database, campaign_id, session_id, publication_id)
+        if publication.status != "draft":
+            raise HTTPException(status_code=409, detail="Publication revision was already published")
+        if resolved.otterwiki_repository_path is None:
+            raise HTTPException(status_code=409, detail="OtterWiki publishing is not configured")
+        try:
+            commit, blob_hash = publish_to_otterwiki(
+                resolved.otterwiki_repository_path, publication.target_path, publication.content,
+                f"Publish {publication.title} from Campaign Manager",
+                publication.last_published_blob_hash, request.confirm_overwrite,
+            )
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        publication.status = "published"
+        publication.last_published_blob_hash = blob_hash
+        publication.published_commit = commit
+        publication.published_by_id = user.id
+        publication.published_at = datetime.now(UTC)
+        game_session = database.get(GameSession, session_id)
+        game_session.status = "published"
+        database.commit()
+        database.refresh(publication)
+        return publication
 
     @app.post(
         "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/audio",

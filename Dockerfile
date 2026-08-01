@@ -10,6 +10,10 @@ RUN useradd --uid 99 --gid 100 --create-home campaign
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY alembic.ini ./
