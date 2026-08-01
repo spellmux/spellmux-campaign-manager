@@ -51,6 +51,29 @@ class AnalysisResult(BaseModel):
 Analyze = Callable[[str, str, dict[str, Any]], tuple[AnalysisResult, dict[str, Any]]]
 
 
+def ollama_status(settings: Settings, timeout: float = 3) -> dict[str, Any]:
+    """Return bounded readiness diagnostics without exposing the model service publicly."""
+    if settings.analysis_provider != "ollama":
+        return {"configured": False, "ready": False, "model": settings.analysis_model, "models": []}
+    request = urllib.request.Request(f"{settings.analysis_base_url}/api/tags", method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            envelope = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.HTTPError) as exc:
+        return {
+            "configured": True, "ready": False, "model": settings.analysis_model,
+            "models": [], "detail": str(exc)[:500],
+        }
+    models = [item.get("name") for item in envelope.get("models", []) if item.get("name")]
+    requested_base = settings.analysis_model.split(":", 1)[0]
+    available = any(name == settings.analysis_model or name.split(":", 1)[0] == requested_base for name in models)
+    return {
+        "configured": True, "ready": available, "model": settings.analysis_model,
+        "models": models,
+        "detail": None if available else "Configured model has not been pulled",
+    }
+
+
 def process_analysis_job(
     database: Session, settings: Settings, job: Job, analyze: Analyze | None = None
 ) -> None:
@@ -167,7 +190,7 @@ def ollama_analyzer(settings: Settings) -> Analyze:
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "format": schema,
-            "options": {"temperature": 0},
+            "options": {"temperature": 0, "num_ctx": settings.analysis_context_tokens},
         }).encode("utf-8")
         request = urllib.request.Request(
             f"{settings.analysis_base_url}/api/chat", data=payload,

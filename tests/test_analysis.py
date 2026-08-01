@@ -1,9 +1,15 @@
 import uuid
+from dataclasses import replace
 
 from sqlalchemy import select
 from test_auth_campaigns import configured_client, create_campaign_and_session, login
 
-from campaign_manager.analysis import AnalysisResult, build_analysis_prompt, process_analysis_job
+from campaign_manager.analysis import (
+    AnalysisResult,
+    build_analysis_prompt,
+    ollama_status,
+    process_analysis_job,
+)
 from campaign_manager.database import session_factory
 from campaign_manager.models import AnalysisProposal, CampaignGuideEntry, GameSession, Job
 
@@ -106,3 +112,8 @@ def test_prompt_respects_input_limit(tmp_path) -> None:
     )
     assert len(prompt) <= 1_000
     assert 0 < len(included) < 50
+
+
+def test_analysis_status_is_disabled_by_default(tmp_path) -> None:
+    status = ollama_status(replace(_settings(tmp_path), analysis_provider="disabled"))
+    assert status == {"configured": False, "ready": False, "model": "qwen3:4b", "models": []}

@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from campaign_manager import __version__
+from campaign_manager.analysis import ollama_status
 from campaign_manager.artifacts import ingest_audio, ingest_text
 from campaign_manager.auth import authenticate, current_user, issue_token, revoke_token
 from campaign_manager.comparison import compare_transcripts
@@ -146,6 +147,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/auth/me", response_model=UserResponse, tags=["authentication"])
     def me(user: User = Depends(current_user)) -> User:
         return user
+
+    @app.get("/api/v1/analysis/status", tags=["analysis-review"])
+    def analysis_status(user: User = Depends(current_user)) -> dict[str, object]:
+        del user
+        return ollama_status(resolved)
 
     @app.get("/api/v1/campaigns", response_model=list[CampaignResponse], tags=["campaigns"])
     def list_campaigns(

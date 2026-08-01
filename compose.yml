@@ -28,6 +28,9 @@ services:
       CAMPAIGN_ANALYSIS_PROVIDER: ${CAMPAIGN_ANALYSIS_PROVIDER:-disabled}
       CAMPAIGN_ANALYSIS_MODEL: ${CAMPAIGN_ANALYSIS_MODEL:-qwen3:4b}
       CAMPAIGN_ANALYSIS_BASE_URL: ${CAMPAIGN_ANALYSIS_BASE_URL:-http://ollama:11434}
+      CAMPAIGN_ANALYSIS_TIMEOUT_SECONDS: ${CAMPAIGN_ANALYSIS_TIMEOUT_SECONDS:-21600}
+      CAMPAIGN_ANALYSIS_MAX_INPUT_CHARS: ${CAMPAIGN_ANALYSIS_MAX_INPUT_CHARS:-240000}
+      CAMPAIGN_ANALYSIS_CONTEXT_TOKENS: ${CAMPAIGN_ANALYSIS_CONTEXT_TOKENS:-65536}
     ports:
       - "${CAMPAIGN_HTTP_PORT:-8088}:8088"
     volumes:
@@ -46,13 +49,56 @@ services:
     build: .
     restart: unless-stopped
     command: ["campaign-worker"]
-    environment: *campaign-environment
+    environment:
+      <<: *campaign-environment
+      CAMPAIGN_ANALYSIS_PROVIDER: disabled
     volumes:
       - ${CAMPAIGN_ARTIFACT_PATH:-./data/artifacts}:/data/artifacts
       - ${CAMPAIGN_PUBLISH_PATH:-./data/publish}:/data/publish
     depends_on:
       database:
         condition: service_healthy
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ${CAMPAIGN_MODEL_PATH:-./data/models}/ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  ollama-model:
+    image: ollama/ollama:latest
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "${CAMPAIGN_ANALYSIS_MODEL:-qwen3:4b}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  analysis-worker:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    command: ["campaign-worker"]
+    environment:
+      <<: *campaign-environment
+      CAMPAIGN_TRANSCRIPTION_PROVIDER: disabled
+      CAMPAIGN_DIARIZATION_PROVIDER: disabled
+      CAMPAIGN_ANALYSIS_PROVIDER: ollama
+      CAMPAIGN_ANALYSIS_BASE_URL: http://ollama:11434
+    volumes:
+      - ${CAMPAIGN_ARTIFACT_PATH:-./data/artifacts}:/data/artifacts
+    depends_on:
+      database:
+        condition: service_healthy
+      ollama-model:
+        condition: service_completed_successfully
 
   diarization-worker:
     build:

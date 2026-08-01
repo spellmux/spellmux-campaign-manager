@@ -33,6 +33,7 @@ class Settings:
     analysis_base_url: str = "http://ollama:11434"
     analysis_timeout_seconds: int = 21_600
     analysis_max_input_chars: int = 240_000
+    analysis_context_tokens: int = 65_536
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -66,6 +67,7 @@ class Settings:
             analysis_base_url=os.getenv("CAMPAIGN_ANALYSIS_BASE_URL", "http://ollama:11434").rstrip("/"),
             analysis_timeout_seconds=_integer_environment("CAMPAIGN_ANALYSIS_TIMEOUT_SECONDS", 21_600),
             analysis_max_input_chars=_integer_environment("CAMPAIGN_ANALYSIS_MAX_INPUT_CHARS", 240_000),
+            analysis_context_tokens=_integer_environment("CAMPAIGN_ANALYSIS_CONTEXT_TOKENS", 65_536),
             log_level=os.getenv("CAMPAIGN_LOG_LEVEL", "INFO").upper(),
         )
 
@@ -95,6 +97,7 @@ class Settings:
             "analysis_base_url": self.analysis_base_url,
             "analysis_timeout_seconds": self.analysis_timeout_seconds,
             "analysis_max_input_chars": self.analysis_max_input_chars,
+            "analysis_context_tokens": self.analysis_context_tokens,
             "log_level": self.log_level,
         }
 
