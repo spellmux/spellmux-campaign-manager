@@ -8,6 +8,24 @@ from campaign_manager.database import session_factory
 from campaign_manager.models import Artifact, User
 
 
+def test_sessions_are_ordered_by_session_date_with_undated_last(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, _session_id = create_campaign_and_session(client, headers)
+    for title, session_date in (("Earlier", "2025-01-02"), ("Undated", None), ("Middle", "2026-01-02")):
+        response = client.post(
+            f"/api/v1/campaigns/{campaign_id}/sessions",
+            headers=headers,
+            json={"title": title, "session_date": session_date},
+        )
+        assert response.status_code == 201
+
+    sessions = client.get(f"/api/v1/campaigns/{campaign_id}/sessions", headers=headers).json()
+    assert [item["title"] for item in sessions] == [
+        "Earlier", "Middle", "Arrival at the Crossroads", "Undated",
+    ]
+
+
 def test_session_guide_speaker_and_text_source_are_manageable(tmp_path) -> None:
     client = configured_client(tmp_path)
     headers = {"Authorization": f"Bearer {login(client)}"}

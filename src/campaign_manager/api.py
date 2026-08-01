@@ -441,7 +441,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             database.scalars(
                 select(GameSession)
                 .where(GameSession.campaign_id == campaign_id)
-                .order_by(GameSession.session_date.desc(), GameSession.created_at.desc())
+                .order_by(
+                    GameSession.session_date.is_(None),
+                    GameSession.session_date.asc(),
+                    GameSession.title.asc(),
+                )
             )
         )
 
