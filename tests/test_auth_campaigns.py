@@ -272,3 +272,52 @@ def test_transcript_corrections_create_new_version(tmp_path) -> None:
     assert revised.json()["kind"] == "corrected_transcript"
     assert raw_after["segments"][0]["text"] == "Kaylin enters."
     assert corrected.json()["segments"][0]["text"] == "Caelen enters."
+
+
+def test_gm_can_validate_speaker_clip_and_approve_reference(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, session_id = create_campaign_and_session(client, headers)
+
+    profile = client.post(
+        f"/api/v1/campaigns/{campaign_id}/speakers",
+        headers=headers,
+        json={"display_name": "Rob", "notes": "Game Master"},
+    )
+    reviewed = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/speaker-reviews",
+        headers=headers,
+        json={
+            "cluster_label": "SPEAKER_00",
+            "start_seconds": 42,
+            "end_seconds": 50,
+            "speaker_profile_id": profile.json()["id"],
+            "disposition": "confirmed",
+            "approved_reference": True,
+            "notes": "Clean solo speech",
+        },
+    )
+    listed = client.get(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/speaker-reviews",
+        headers=headers,
+    )
+
+    assert profile.status_code == 201
+    assert reviewed.status_code == 201
+    assert reviewed.json()["speaker_name"] == "Rob"
+    assert reviewed.json()["approved_reference"] is True
+    assert listed.json() == [reviewed.json()]
+
+    invalid = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/speaker-reviews",
+        headers=headers,
+        json={
+            "cluster_label": "SPEAKER_01",
+            "start_seconds": 60,
+            "end_seconds": 70,
+            "disposition": "uncertain",
+            "approved_reference": True,
+        },
+    )
+    assert invalid.status_code == 422
+    assert "confirmed speaker" in invalid.json()["detail"]

@@ -26,6 +26,8 @@ from campaign_manager.models import (
     CampaignRole,
     GameSession,
     Job,
+    SpeakerProfile,
+    SpeakerReview,
     User,
 )
 from campaign_manager.permissions import require_campaign_role
@@ -44,6 +46,10 @@ from campaign_manager.schemas import (
     LoginRequest,
     SessionCreate,
     SessionResponse,
+    SpeakerProfileCreate,
+    SpeakerProfileResponse,
+    SpeakerReviewCreate,
+    SpeakerReviewResponse,
     TextSourceCreate,
     TokenResponse,
     TranscriptRevisionCreate,
@@ -238,6 +244,63 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return entry
 
     @app.get(
+        "/api/v1/campaigns/{campaign_id}/speakers",
+        response_model=list[SpeakerProfileResponse],
+        tags=["speaker-review"],
+    )
+    def list_speaker_profiles(
+        campaign_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[SpeakerProfile]:
+        require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        return list(
+            database.scalars(
+                select(SpeakerProfile)
+                .where(SpeakerProfile.campaign_id == campaign_id)
+                .order_by(SpeakerProfile.display_name)
+            )
+        )
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/speakers",
+        response_model=SpeakerProfileResponse,
+        status_code=201,
+        tags=["speaker-review"],
+    )
+    def create_speaker_profile(
+        campaign_id: uuid.UUID,
+        request: SpeakerProfileCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> SpeakerProfile:
+        require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        profile = SpeakerProfile(
+            campaign_id=campaign_id,
+            display_name=request.display_name.strip(),
+            notes=request.notes.strip(),
+            created_by_id=user.id,
+        )
+        database.add(profile)
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="Speaker name already exists") from exc
+        database.refresh(profile)
+        return profile
+
+    @app.get(
         "/api/v1/campaigns/{campaign_id}/sessions",
         response_model=list[SessionResponse],
         tags=["sessions"],
@@ -399,6 +462,119 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 select(Job).where(Job.session_id == session_id).order_by(Job.created_at.desc())
             )
         )
+
+    def speaker_review_response(review: SpeakerReview) -> SpeakerReviewResponse:
+        return SpeakerReviewResponse(
+            id=review.id,
+            session_id=review.session_id,
+            cluster_label=review.cluster_label,
+            start_seconds=review.start_seconds,
+            end_seconds=review.end_seconds,
+            speaker_profile_id=review.speaker_profile_id,
+            speaker_name=(
+                review.speaker_profile.display_name if review.speaker_profile is not None else None
+            ),
+            disposition=review.disposition,
+            approved_reference=review.approved_reference,
+            notes=review.notes,
+            created_at=review.created_at,
+            updated_at=review.updated_at,
+        )
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/speaker-reviews",
+        response_model=list[SpeakerReviewResponse],
+        tags=["speaker-review"],
+    )
+    def list_speaker_reviews(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[SpeakerReviewResponse]:
+        require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        reviews = database.scalars(
+            select(SpeakerReview)
+            .join(GameSession, GameSession.id == SpeakerReview.session_id)
+            .where(
+                SpeakerReview.session_id == session_id,
+                GameSession.campaign_id == campaign_id,
+            )
+            .order_by(SpeakerReview.cluster_label, SpeakerReview.start_seconds)
+        ).all()
+        return [speaker_review_response(review) for review in reviews]
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/speaker-reviews",
+        response_model=SpeakerReviewResponse,
+        status_code=201,
+        tags=["speaker-review"],
+    )
+    def create_speaker_review(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        request: SpeakerReviewCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> SpeakerReviewResponse:
+        require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        session_exists = database.scalar(
+            select(GameSession.id).where(
+                GameSession.id == session_id,
+                GameSession.campaign_id == campaign_id,
+            )
+        )
+        if session_exists is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if request.end_seconds <= request.start_seconds or request.end_seconds - request.start_seconds > 30:
+            raise HTTPException(status_code=422, detail="Speaker clips must be between 1 and 30 seconds")
+        profile = None
+        if request.speaker_profile_id is not None:
+            profile = database.scalar(
+                select(SpeakerProfile).where(
+                    SpeakerProfile.id == request.speaker_profile_id,
+                    SpeakerProfile.campaign_id == campaign_id,
+                )
+            )
+            if profile is None:
+                raise HTTPException(status_code=422, detail="Speaker profile is not in this campaign")
+        if request.approved_reference and (
+            profile is None or request.disposition != "confirmed"
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="A reference clip must have a confirmed speaker",
+            )
+        review = SpeakerReview(
+            session_id=session_id,
+            cluster_label=request.cluster_label.strip(),
+            start_seconds=request.start_seconds,
+            end_seconds=request.end_seconds,
+            speaker_profile_id=request.speaker_profile_id,
+            disposition=request.disposition,
+            approved_reference=request.approved_reference,
+            notes=request.notes.strip(),
+            reviewed_by_id=user.id,
+        )
+        database.add(review)
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="This speaker clip was already reviewed") from exc
+        database.refresh(review)
+        review.speaker_profile = profile
+        return speaker_review_response(review)
 
     @app.get(
         "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/artifacts",

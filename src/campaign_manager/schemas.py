@@ -175,3 +175,53 @@ class CampaignGuideResponse(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class SpeakerProfileCreate(BaseModel):
+    display_name: str = Field(min_length=1, max_length=120)
+    notes: str = Field(default="", max_length=20_000)
+
+
+class SpeakerProfileResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    campaign_id: uuid.UUID
+    display_name: str
+    notes: str
+    created_at: datetime
+
+
+class SpeakerReviewCreate(BaseModel):
+    cluster_label: str = Field(min_length=1, max_length=80)
+    start_seconds: int = Field(ge=0)
+    end_seconds: int = Field(gt=0)
+    speaker_profile_id: uuid.UUID | None = None
+    disposition: str = "confirmed"
+    approved_reference: bool = False
+    notes: str = Field(default="", max_length=20_000)
+
+    @field_validator("disposition")
+    @classmethod
+    def valid_disposition(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"confirmed", "uncertain", "crosstalk", "noise"}:
+            raise ValueError("Unsupported speaker review disposition")
+        return normalized
+
+
+class SpeakerReviewResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    session_id: uuid.UUID
+    cluster_label: str
+    start_seconds: int
+    end_seconds: int
+    speaker_profile_id: uuid.UUID | None
+    speaker_name: str | None = None
+    disposition: str
+    approved_reference: bool
+    notes: str
+    created_at: datetime
+    updated_at: datetime

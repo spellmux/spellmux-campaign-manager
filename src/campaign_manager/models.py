@@ -140,6 +140,24 @@ class CampaignGuideEntry(Base):
     )
 
 
+class SpeakerProfile(Base):
+    __tablename__ = "speaker_profiles"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "display_name", name="uq_speaker_profile_name"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="CASCADE"), index=True
+    )
+    display_name: Mapped[str] = mapped_column(String(120))
+    notes: Mapped[str] = mapped_column(Text, default="")
+    created_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class GameSession(Base):
     __tablename__ = "game_sessions"
 
@@ -154,6 +172,37 @@ class GameSession(Base):
         ForeignKey("users.id", ondelete="RESTRICT")
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class SpeakerReview(Base):
+    __tablename__ = "speaker_reviews"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "cluster_label", "start_seconds", name="uq_speaker_review_clip"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), index=True
+    )
+    cluster_label: Mapped[str] = mapped_column(String(80))
+    start_seconds: Mapped[int] = mapped_column(Integer)
+    end_seconds: Mapped[int] = mapped_column(Integer)
+    speaker_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("speaker_profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    disposition: Mapped[str] = mapped_column(String(20), default="confirmed")
+    approved_reference: Mapped[bool] = mapped_column(Boolean, default=False)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    reviewed_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+    speaker_profile: Mapped[SpeakerProfile | None] = relationship()
 
 
 class Artifact(Base):
