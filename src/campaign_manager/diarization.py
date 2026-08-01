@@ -22,6 +22,7 @@ from campaign_manager.transcription import _contained_path
 Diarize = Callable[[Path], Iterable[tuple[float, float, str]]]
 
 MUSIC_DISPOSITIONS = {"music", "background_music", "featured_song"}
+UNUSABLE_VOICE_DISPOSITIONS = {"uncertain", "crosstalk", "noise"}
 
 
 def cluster_resolutions(reviews: Iterable[SpeakerReview]) -> dict[str, dict[str, Any]]:
@@ -46,11 +47,18 @@ def cluster_resolutions(reviews: Iterable[SpeakerReview]) -> dict[str, dict[str,
                 "status": "reviewed", "disposition": disposition,
                 "display_name": disposition.replace("_", " ").title(),
             }
-        elif len(profiles) == 1 and dispositions == {"confirmed"}:
+        elif (
+            len(profiles) == 1
+            and "confirmed" in dispositions
+            and dispositions <= ({"confirmed"} | UNUSABLE_VOICE_DISPOSITIONS)
+        ):
             profile_id, display_name = next(iter(profiles.items()))
             resolved[label] = {
                 "status": "reviewed", "disposition": "confirmed",
                 "speaker_profile_id": str(profile_id), "display_name": display_name,
+                "excluded_clip_count": sum(
+                    item.disposition in UNUSABLE_VOICE_DISPOSITIONS for item in items
+                ),
             }
         else:
             resolved[label] = {

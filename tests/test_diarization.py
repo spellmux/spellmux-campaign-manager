@@ -61,14 +61,34 @@ def test_reviewed_clusters_attribute_people_and_music() -> None:
     assert segments[1]["speaker_disposition"] == "featured_song"
 
 
-def test_conflicting_cluster_reviews_need_attention() -> None:
+def test_unusable_clip_does_not_conflict_with_confirmed_cluster_identity() -> None:
+    profile_id = uuid.uuid4()
     reviews = [
         SimpleNamespace(
             cluster_label="SPEAKER_00", disposition="confirmed",
-            speaker_profile_id=uuid.uuid4(), speaker_profile=SimpleNamespace(display_name="Rob"),
+            speaker_profile_id=profile_id, speaker_profile=SimpleNamespace(display_name="Rob"),
         ),
         SimpleNamespace(
             cluster_label="SPEAKER_00", disposition="crosstalk",
+            speaker_profile_id=None, speaker_profile=None,
+        ),
+    ]
+
+    resolution = cluster_resolutions(reviews)["SPEAKER_00"]
+
+    assert resolution["status"] == "reviewed"
+    assert resolution["speaker_profile_id"] == str(profile_id)
+    assert resolution["excluded_clip_count"] == 1
+
+
+def test_cluster_with_only_unusable_clips_needs_attention() -> None:
+    reviews = [
+        SimpleNamespace(
+            cluster_label="SPEAKER_00", disposition="crosstalk",
+            speaker_profile_id=None, speaker_profile=None,
+        ),
+        SimpleNamespace(
+            cluster_label="SPEAKER_00", disposition="noise",
             speaker_profile_id=None, speaker_profile=None,
         ),
     ]
