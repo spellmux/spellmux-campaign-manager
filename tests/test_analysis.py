@@ -121,6 +121,8 @@ def test_prompt_includes_resolved_speaker_attribution(tmp_path) -> None:
     )
 
     assert "Rob: I open the door." in prompt
+    assert 'Return exactly one JSON object with a "proposals" array' in prompt
+    assert "session_summary, character, location" in prompt
 
 
 def test_analysis_status_is_disabled_by_default(tmp_path) -> None:

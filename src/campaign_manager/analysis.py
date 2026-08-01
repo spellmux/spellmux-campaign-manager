@@ -178,6 +178,12 @@ Rules:
 - Evidence must quote the source and identify its bracketed segment numbers.
 - Mark secrets, uncertain identity, enemy plans, and unresolved questions as GM visibility.
 - Confidence measures source support, not narrative importance.
+- Return exactly one JSON object with a "proposals" array and no surrounding commentary.
+- Each proposal must contain: kind, title, body, aliases, evidence, confidence, visibility.
+- kind must be one of: session_summary, character, location, item, spell, creature, quest,
+  faction, deity, rule, important_decision, unresolved_question.
+- Each evidence item must contain a segment_ids integer array and a non-empty quote.
+- confidence is a number from 0 through 1. visibility is either "gm" or "player".
 
 Source segments:
 """
@@ -207,7 +213,11 @@ def ollama_analyzer(settings: Settings) -> Analyze:
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "format": schema,
+            # Ollama's schema-to-grammar compiler rejects some valid Pydantic
+            # schemas. JSON mode plus strict Pydantic validation is portable
+            # across local models and still fails closed on malformed output.
+            "format": "json",
+            "think": False,
             "options": {"temperature": 0, "num_ctx": settings.analysis_context_tokens},
         }).encode("utf-8")
         request = urllib.request.Request(
