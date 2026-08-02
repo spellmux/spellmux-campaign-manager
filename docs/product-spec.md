@@ -63,3 +63,11 @@ what becomes visible to players or is published externally.
 - Real-time recording or transcription
 - Tactical map generation guarantees
 - Unrestricted host or Unraid administration through MCP
+
+## Future GM planning
+
+The future GM-only Planning Studio will use approved campaign context to propose encounters,
+story beats, session outlines, entities, and other preparation material without treating drafts
+as canon. It will also provide deterministic and optional model-assisted name generation with
+campaign naming profiles, collision detection, reservations, and explicit promotion into entity
+drafts. See [the Planning Studio roadmap](planning-studio.md).

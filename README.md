@@ -32,7 +32,8 @@ provide faster-whisper transcription, pyannote diarization, and Ollama analysis.
 is the portable reference deployment; Unraid is a supported deployment target.
 
 See [the architecture guide](docs/architecture.md), [product specification](docs/product-spec.md),
-[local models and hardware roadmap](docs/models-and-hardware.md), and
+[local models and hardware roadmap](docs/models-and-hardware.md),
+[Planning Studio roadmap](docs/planning-studio.md), and
 [Unraid deployment notes](deploy/unraid/README.md) for more detail.
 
 ## Quick start with Docker Compose
