@@ -13,6 +13,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -63,6 +64,7 @@ from campaign_manager.schemas import (
     CampaignGuideResponse,
     CampaignGuideUpdate,
     CampaignResponse,
+    CampaignUpdate,
     JobPriorityUpdate,
     JobResponse,
     LoginRequest,
@@ -104,6 +106,11 @@ def _campaign_response(campaign: Campaign, role: str) -> CampaignResponse:
         slug=campaign.slug,
         name=campaign.name,
         description=campaign.description,
+        game_system=campaign.game_system,
+        play_mode=campaign.play_mode,
+        vtt=campaign.vtt,
+        character_source=campaign.character_source,
+        notes=campaign.notes,
         created_at=campaign.created_at,
         role=role,
     )
@@ -112,6 +119,8 @@ def _campaign_response(campaign: Campaign, role: str) -> CampaignResponse:
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings.from_environment()
     app = FastAPI(title="Campaign Manager", version=__version__)
+    static_root = Path(__file__).parent / "static"
+    app.mount("/assets", StaticFiles(directory=static_root / "assets"), name="assets")
 
     @app.middleware("http")
     async def security_headers(request, call_next):
@@ -128,7 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
-        return FileResponse(Path(__file__).parent / "static" / "index.html")
+        return FileResponse(static_root / "index.html")
 
     @app.get("/api/v1/health", tags=["system"])
     def health() -> dict[str, object]:
@@ -217,6 +226,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail="Campaign slug already exists") from exc
         database.refresh(campaign)
         return _campaign_response(campaign, CampaignRole.OWNER.value)
+
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}",
+        response_model=CampaignResponse,
+        tags=["campaigns"],
+    )
+    def update_campaign(
+        campaign_id: uuid.UUID,
+        request: CampaignUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> CampaignResponse:
+        membership = require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        campaign = database.get(Campaign, campaign_id)
+        if campaign is None:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        campaign.name = request.name.strip()
+        campaign.description = request.description.strip()
+        campaign.game_system = request.game_system.strip()
+        campaign.play_mode = request.play_mode
+        campaign.vtt = request.vtt.strip()
+        campaign.character_source = request.character_source.strip()
+        campaign.notes = request.notes.strip()
+        database.commit()
+        database.refresh(campaign)
+        return _campaign_response(campaign, membership.role)
 
     @app.get(
         "/api/v1/campaigns/{campaign_id}/guide",

@@ -99,6 +99,34 @@ def test_campaign_owner_can_create_and_list_campaign(tmp_path) -> None:
     assert listed.json() == [created.json()]
 
 
+def test_campaign_owner_can_update_campaign_settings(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign = client.post("/api/v1/campaigns", headers=headers, json={"name": "Wonderland"}).json()
+
+    response = client.put(
+        f"/api/v1/campaigns/{campaign['id']}",
+        headers=headers,
+        json={
+            "name": "Wonderland After Dark",
+            "description": "Thursday night campaign",
+            "game_system": "D&D 5.5",
+            "play_mode": "in-person",
+            "vtt": "Foundry VTT",
+            "character_source": "D&D Beyond",
+            "notes": "Rolls are physical and the VTT is mainly used for maps.",
+        },
+    )
+
+    assert response.status_code == 200
+    updated = response.json()
+    assert updated["name"] == "Wonderland After Dark"
+    assert updated["game_system"] == "D&D 5.5"
+    assert updated["play_mode"] == "in_person"
+    assert updated["vtt"] == "Foundry VTT"
+    assert updated["character_source"] == "D&D Beyond"
+
+
 def test_campaign_endpoints_require_authentication(tmp_path) -> None:
     client = configured_client(tmp_path)
 

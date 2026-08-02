@@ -1,0 +1,8 @@
+.settings-view dl { display:grid; gap:.75rem; }
+.settings-view dl div { border-bottom:1px solid #354052; padding-bottom:.65rem; }
+.settings-view dt { color:#aab5c5; font-size:.85rem; }
+.settings-view dd { margin:.2rem 0 0; white-space:pre-wrap; }
+.settings-form label { display:grid; gap:.35rem; color:#c7d8f5; }
+.settings-form input,.settings-form select,.settings-form textarea { width:100%; box-sizing:border-box; }
+.editor-actions { display:flex; flex-wrap:wrap; gap:.7rem; }
+.editor-error { color:#ff8f8f; }

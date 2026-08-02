@@ -41,6 +41,24 @@ class CampaignCreate(BaseModel):
     description: str = Field(default="", max_length=20_000)
 
 
+class CampaignUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=20_000)
+    game_system: str = Field(default="", max_length=120)
+    play_mode: str = Field(default="", max_length=40)
+    vtt: str = Field(default="", max_length=160)
+    character_source: str = Field(default="", max_length=160)
+    notes: str = Field(default="", max_length=20_000)
+
+    @field_validator("play_mode")
+    @classmethod
+    def valid_play_mode(cls, value: str) -> str:
+        normalized = value.strip().casefold().replace("-", "_").replace(" ", "_")
+        if normalized not in {"", "in_person", "online", "hybrid"}:
+            raise ValueError("Play mode must be in person, online, hybrid, or blank")
+        return normalized
+
+
 class CampaignResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -48,6 +66,11 @@ class CampaignResponse(BaseModel):
     slug: str
     name: str
     description: str
+    game_system: str
+    play_mode: str
+    vtt: str
+    character_source: str
+    notes: str
     created_at: datetime
     role: str
 

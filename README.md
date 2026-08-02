@@ -69,6 +69,19 @@ python -m pytest
 python -m ruff check .
 ```
 
+Frontend changes require Node 22 or newer. Build the typed Preact assets into the Python
+package before running the server from a source checkout:
+
+```bash
+cd frontend
+npm ci
+npm run check
+npm run build:package
+```
+
+Docker performs this frontend build automatically; Node is not installed in the final runtime
+image.
+
 Useful local entry points are `campaign-server`, `campaign-worker`, and `campaignctl doctor`.
 
 ## Project status and roadmap

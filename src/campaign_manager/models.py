@@ -87,6 +87,11 @@ class Campaign(Base):
     slug: Mapped[str] = mapped_column(String(100), unique=True)
     name: Mapped[str] = mapped_column(String(160))
     description: Mapped[str] = mapped_column(Text, default="")
+    game_system: Mapped[str] = mapped_column(String(120), default="")
+    play_mode: Mapped[str] = mapped_column(String(40), default="")
+    vtt: Mapped[str] = mapped_column(String(160), default="")
+    character_source: Mapped[str] = mapped_column(String(160), default="")
+    notes: Mapped[str] = mapped_column(Text, default="")
     created_by_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT")
     )
