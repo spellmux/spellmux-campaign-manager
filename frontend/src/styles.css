@@ -19,3 +19,18 @@
 .confirm-panel { border-color:#8a4141; }
 .danger { background:#8d3030; border-color:#b74b4b; }
 @media (max-width:700px) { .guide-fields-two { grid-template-columns:1fr; } .guide-entry-heading,.editor-heading { flex-direction:column; } }
+.morning-review-editor,.review-card-list,.review-edit-form { display:grid; gap:1rem; }
+.review-toolbar,.review-card-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; }
+.review-toolbar,.review-card,.review-edit-form,.review-empty { border:1px solid #354052; border-radius:.7rem; padding:1rem; background:#151c27; }
+.review-card h3 { margin:.2rem 0 0; }
+.review-badges { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:.4rem; }
+.review-badges span,.review-confidence { border:1px solid #45536a; border-radius:999px; color:#b9c9e4; font-size:.78rem; padding:.2rem .55rem; }
+.review-approved { border-color:#356b50; }.review-rejected { opacity:.72; }
+.review-body { white-space:pre-wrap; line-height:1.55; }
+.review-edit-form label { display:grid; gap:.35rem; color:#c7d8f5; }
+.review-edit-form input,.review-edit-form select,.review-edit-form textarea { width:100%; box-sizing:border-box; }
+.evidence-list { border-top:1px solid #354052; padding-top:.7rem; }
+.evidence-item { display:grid; gap:.5rem; padding:.7rem 0; }
+.evidence-item button { justify-self:start; }
+.review-empty { display:grid; gap:.35rem; }
+@media (max-width:700px) { .review-toolbar,.review-card-heading { flex-direction:column; } .review-badges { justify-content:flex-start; } }

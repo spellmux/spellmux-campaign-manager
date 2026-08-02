@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -115,6 +116,15 @@ def process_analysis_job(
     prompts = build_analysis_prompts(
         game_session, guide, segments, chunk_limit, settings.analysis_chunk_overlap_segments
     )
+    started = time.monotonic()
+    job.payload = {
+        **job.payload,
+        "analysis_progress": {
+            "stage": "extracting", "completed_chunks": 0, "total_chunks": len(prompts),
+            "percent": 0, "estimated_seconds_remaining": None,
+        },
+    }
+    database.commit()
     analyzer = analyze or ollama_analyzer(settings)
     extracted_runs: list[tuple[list[ExtractedProposal], list[tuple[int, dict[str, Any]]]]] = []
     response_metadata: list[dict[str, Any]] = []
@@ -122,6 +132,19 @@ def process_analysis_job(
         result, metadata = analyzer(prompt, settings.analysis_model, AnalysisResult.model_json_schema())
         extracted_runs.append((result.proposals, included))
         response_metadata.append({"chunk_index": chunk_index, **metadata})
+        completed = chunk_index + 1
+        elapsed = time.monotonic() - started
+        remaining = (elapsed / completed) * (len(prompts) - completed)
+        job.payload = {
+            **job.payload,
+            "analysis_progress": {
+                "stage": "extracting" if completed < len(prompts) else "reducing",
+                "completed_chunks": completed, "total_chunks": len(prompts),
+                "percent": round(completed / len(prompts) * 100),
+                "estimated_seconds_remaining": round(remaining),
+            },
+        }
+        database.commit()
     merged = merge_chunk_proposals(extracted_runs)
     if not merged:
         raise ValueError(
@@ -153,6 +176,14 @@ def process_analysis_job(
             },
             created_by_id=creator.id,
         ))
+    job.payload = {
+        **job.payload,
+        "analysis_progress": {
+            **job.payload.get("analysis_progress", {}),
+            "stage": "complete", "percent": 100, "estimated_seconds_remaining": 0,
+            "finding_count": len(merged),
+        },
+    }
     database.commit()
 
 

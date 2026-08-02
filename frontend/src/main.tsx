@@ -30,6 +30,19 @@ type GuideEntry = {
 type GuideState = { campaignId: string; role: string; entries: GuideEntry[] };
 type GuideEvent = CustomEvent<GuideState>;
 
+type Evidence = { quote: string; start_seconds: number | null; end_seconds: number | null };
+type Proposal = {
+  id: string; kind: string; title: string; body: string; aliases: string[];
+  evidence: Evidence[]; confidence: number | null; visibility: "gm" | "player";
+  status: "proposed" | "approved" | "rejected"; provider: string; model: string;
+};
+type AnalysisJob = { status: string; error: string | null; payload: Record<string, unknown> };
+type ReviewState = {
+  campaignId: string; sessionId: string; role: string; filter: string;
+  proposals: Proposal[]; latestJob: AnalysisJob | null;
+};
+type ReviewEvent = CustomEvent<ReviewState>;
+
 const guideKinds = [
   "instruction", "character", "location", "faction", "item", "spell", "quest",
   "creature", "deity", "rule", "pronunciation", "other",
@@ -314,7 +327,129 @@ function CampaignGuideEditor({ root }: { root: HTMLElement }) {
   );
 }
 
+function reviewFromRoot(root: HTMLElement): ReviewState {
+  try {
+    return root.dataset.review
+      ? JSON.parse(root.dataset.review)
+      : { campaignId: "", sessionId: "", role: "player", filter: "proposed", proposals: [], latestJob: null };
+  } catch {
+    return { campaignId: "", sessionId: "", role: "player", filter: "proposed", proposals: [], latestJob: null };
+  }
+}
+
+function MorningReviewEditor({ root }: { root: HTMLElement }) {
+  const [review, setReview] = useState<ReviewState>(() => reviewFromRoot(root));
+  const [draft, setDraft] = useState<Proposal | null>(null);
+  const [busy, setBusy] = useState<string[]>([]);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const receiveReview = (event: Event) => setReview((event as ReviewEvent).detail);
+    window.addEventListener("campaign-manager:analysis-review", receiveReview);
+    return () => window.removeEventListener("campaign-manager:analysis-review", receiveReview);
+  }, []);
+
+  useEffect(() => {
+    root.dataset.dirty = draft ? "true" : "false";
+    if (!draft) return;
+    const protectDraft = (event: BeforeUnloadEvent) => event.preventDefault();
+    window.addEventListener("beforeunload", protectDraft);
+    return () => window.removeEventListener("beforeunload", protectDraft);
+  }, [draft, root]);
+
+  const canEdit = ["owner", "gm"].includes(review.role);
+  const visible = review.proposals.filter((proposal) => review.filter === "all" || proposal.status === review.filter);
+  const updateDraft = <K extends keyof Proposal>(field: K, value: Proposal[K]) =>
+    setDraft((current) => current ? { ...current, [field]: value } : current);
+
+  const save = async (event: SubmitEvent) => {
+    event.preventDefault();
+    if (!draft || !draft.title.trim()) return setError("Title is required.");
+    setBusy([draft.id]);
+    setError("");
+    try {
+      await apiRequest(
+        `/campaigns/${review.campaignId}/sessions/${review.sessionId}/analysis-proposals/${draft.id}`,
+        { method: "PUT", body: JSON.stringify({ title: draft.title, body: draft.body, aliases: draft.aliases.map((alias) => alias.trim()).filter(Boolean), visibility: draft.visibility }) },
+      );
+      setDraft(null);
+      window.dispatchEvent(new CustomEvent("campaign-manager:analysis-updated"));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to save finding.");
+    } finally {
+      setBusy([]);
+    }
+  };
+
+  const decide = async (proposals: Proposal[], action: "approve" | "reject") => {
+    if (!proposals.length) return;
+    setBusy(proposals.map((proposal) => proposal.id));
+    setError("");
+    try {
+      for (const proposal of proposals) {
+        await apiRequest(
+          `/campaigns/${review.campaignId}/sessions/${review.sessionId}/analysis-proposals/${proposal.id}/${action}`,
+          { method: "POST" },
+        );
+      }
+      window.dispatchEvent(new CustomEvent("campaign-manager:analysis-updated"));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : `Unable to ${action} findings.`);
+      window.dispatchEvent(new CustomEvent("campaign-manager:analysis-updated"));
+    } finally {
+      setBusy([]);
+    }
+  };
+
+  if (draft) {
+    return (
+      <form class="review-edit-form" onSubmit={save}>
+        <div class="editor-heading"><div><span class="guide-kind">{draft.kind.replaceAll("_", " ")}</span><h3>Edit finding</h3></div><span class="review-confidence">{draft.confidence == null ? "Unscored" : `${Math.round(draft.confidence * 100)}% confidence`}</span></div>
+        <label>Title<input value={draft.title} maxLength={200} required autoFocus onInput={(event) => updateDraft("title", event.currentTarget.value)} /></label>
+        <label>Summary or description<textarea value={draft.body} maxLength={50000} rows={14} onInput={(event) => updateDraft("body", event.currentTarget.value)} /></label>
+        <label>Aliases<input value={draft.aliases.join(", ")} onInput={(event) => updateDraft("aliases", event.currentTarget.value.split(","))} /></label>
+        <label>Visibility<select value={draft.visibility} onChange={(event) => updateDraft("visibility", event.currentTarget.value as "gm" | "player")}><option value="gm">GM only</option><option value="player">Players</option></select></label>
+        {draft.evidence.length > 0 && <EvidenceList evidence={draft.evidence} />}
+        {error && <p class="editor-error" role="alert">{error}</p>}
+        <div class="editor-actions"><button type="submit" disabled={busy.length > 0}>{busy.length ? "Saving…" : "Save finding"}</button><button type="button" class="secondary" disabled={busy.length > 0} onClick={() => { setDraft(null); setError(""); }}>Cancel</button></div>
+      </form>
+    );
+  }
+
+  const pending = review.proposals.filter((proposal) => proposal.status === "proposed");
+  const emptyRun = review.latestJob?.status === "succeeded" && review.proposals.length === 0;
+  return (
+    <div class="morning-review-editor">
+      {canEdit && pending.length > 0 && <div class="review-toolbar"><strong>{pending.length} finding{pending.length === 1 ? "" : "s"} need review</strong><div class="editor-actions"><button type="button" onClick={() => decide(pending, "approve")} disabled={busy.length > 0}>Approve all</button><button type="button" class="secondary" onClick={() => decide(pending, "reject")} disabled={busy.length > 0}>Reject all</button></div></div>}
+      {error && <p class="editor-error" role="alert">{error}</p>}
+      {!visible.length && <div class="review-empty"><strong>{emptyRun ? "Analysis produced no findings" : review.filter === "proposed" ? "Nothing needs review" : "No matching findings"}</strong><span class="muted">{emptyRun ? "Run analysis again with another source or model." : review.filter === "proposed" ? "Generated findings will appear here when analysis completes." : "Choose another filter."}</span></div>}
+      <div class="review-card-list">{visible.map((proposal) => (
+        <article class={`review-card review-${proposal.status}`} key={proposal.id}>
+          <div class="review-card-heading"><div><span class="guide-kind">{proposal.kind.replaceAll("_", " ")}</span><h3>{proposal.title}</h3></div><div class="review-badges"><span>{proposal.visibility === "gm" ? "GM only" : "Players"}</span><span>{proposal.status}</span>{proposal.confidence != null && <span>{Math.round(proposal.confidence * 100)}%</span>}</div></div>
+          <p class="review-body">{proposal.body || "No description supplied."}</p>
+          {proposal.aliases.length > 0 && <p class="muted">Aliases: {proposal.aliases.join(", ")}</p>}
+          <EvidenceList evidence={proposal.evidence} />
+          {canEdit && proposal.status === "proposed" && <div class="editor-actions"><button type="button" class="secondary" disabled={busy.includes(proposal.id)} onClick={() => setDraft({ ...proposal, aliases: [...proposal.aliases], evidence: [...proposal.evidence] })}>Edit</button><button type="button" disabled={busy.includes(proposal.id)} onClick={() => decide([proposal], "approve")}>Approve</button><button type="button" class="secondary" disabled={busy.includes(proposal.id)} onClick={() => decide([proposal], "reject")}>Reject</button></div>}
+        </article>
+      ))}</div>
+    </div>
+  );
+}
+
+function EvidenceList({ evidence }: { evidence: Evidence[] }) {
+  if (!evidence.length) return null;
+  return <details class="evidence-list"><summary>{evidence.length} source clip{evidence.length === 1 ? "" : "s"}</summary>{evidence.map((item, index) => <div class="evidence-item" key={`${item.start_seconds}-${index}`}><q>{item.quote}</q>{item.start_seconds != null && <button type="button" class="secondary" onClick={() => window.dispatchEvent(new CustomEvent("campaign-manager:play-evidence", { detail: { start: item.start_seconds!, end: item.end_seconds ?? item.start_seconds! + 15 } }))}>Listen at {formatSeconds(item.start_seconds)}</button>}</div>)}</details>;
+}
+
+function formatSeconds(value: number) {
+  const seconds = Math.max(0, Math.floor(value));
+  return [Math.floor(seconds / 3600), Math.floor((seconds % 3600) / 60), seconds % 60]
+    .map((part) => String(part).padStart(2, "0")).join(":");
+}
+
 const root = document.getElementById("campaign-settings-editor");
 if (root) render(<CampaignSettings root={root} />, root);
 const guideRoot = document.getElementById("campaign-guide-editor");
 if (guideRoot) render(<CampaignGuideEditor root={guideRoot} />, guideRoot);
+const reviewRoot = document.getElementById("proposal-list");
+if (reviewRoot) render(<MorningReviewEditor root={reviewRoot} />, reviewRoot);

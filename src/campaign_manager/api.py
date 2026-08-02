@@ -1018,6 +1018,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return [QueueJobResponse(
             id=job.id, kind=job.kind, status=job.status, priority=job.priority,
             cancel_requested=job.cancel_requested, attempts=job.attempts, error=job.error,
+            payload=job.payload,
             created_at=job.created_at, updated_at=job.updated_at,
             session_id=game_session.id if game_session else None,
             session_title=game_session.title if game_session else None,

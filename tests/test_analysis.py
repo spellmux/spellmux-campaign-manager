@@ -88,6 +88,8 @@ def test_analysis_job_creates_grounded_review_proposals(tmp_path) -> None:
         assert proposal.evidence[0]["start_seconds"] == 12.0
         assert proposal.evidence[0]["end_seconds"] == 16.0
         assert proposal.run_metadata["eval_count"] == 42
+        assert job.payload["analysis_progress"]["stage"] == "complete"
+        assert job.payload["analysis_progress"]["finding_count"] == 1
     assert "character: Caelen" in captured["prompt"]
     assert "[0 12.00-16.00s]" in captured["prompt"]
 

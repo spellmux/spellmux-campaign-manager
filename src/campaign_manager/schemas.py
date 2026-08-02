@@ -109,6 +109,7 @@ class JobResponse(BaseModel):
     cancel_requested: bool
     attempts: int
     error: str | None
+    payload: dict[str, object]
     created_at: datetime
     updated_at: datetime
 
