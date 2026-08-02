@@ -33,7 +33,8 @@ is the portable reference deployment; Unraid is a supported deployment target.
 
 See [the architecture guide](docs/architecture.md), [product specification](docs/product-spec.md),
 [local models and hardware roadmap](docs/models-and-hardware.md),
-[Planning Studio roadmap](docs/planning-studio.md), and
+[Planning Studio roadmap](docs/planning-studio.md),
+[processing-workflow roadmap](docs/processing-workflows.md), and
 [Unraid deployment notes](deploy/unraid/README.md) for more detail.
 
 ## Quick start with Docker Compose
