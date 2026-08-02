@@ -237,6 +237,26 @@ def test_chunk_merge_deduplicates_entities_and_preserves_evidence() -> None:
     assert [item["start_seconds"] for item in evidence] == [12.0, 30.0]
 
 
+def test_analysis_normalizes_overbroad_evidence_and_derives_missing_quote() -> None:
+    proposal = ExtractedProposal.model_validate({
+        "kind": "session_summary", "title": "Session recap", "body": "The party explored.",
+        "aliases": [], "confidence": 0.8, "visibility": "player",
+        "evidence": [{"segment_ids": list(range(224))}],
+    })
+
+    assert proposal.evidence[0].segment_ids == [0, 1, 2, 3, 4, 219, 220, 221, 222, 223]
+    merged = merge_chunk_proposals([(
+        [proposal],
+        [(index, {"start": float(index), "end": float(index + 1), "text": f"Line {index}."})
+         for index in range(224)],
+    )])
+
+    _, evidence = merged[0]
+    assert evidence[0]["quote"] == "Line 0. Line 1. Line 2."
+    assert evidence[0]["start_seconds"] == 0.0
+    assert evidence[0]["end_seconds"] == 224.0
+
+
 def test_prompt_includes_resolved_speaker_attribution(tmp_path) -> None:
     session = GameSession(title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
     prompt, _ = build_analysis_prompt(

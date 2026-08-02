@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -33,7 +33,18 @@ from campaign_manager.review import read_artifact
 
 class ExtractedEvidence(BaseModel):
     segment_ids: list[int] = Field(default_factory=list, max_length=10)
-    quote: str = Field(min_length=1, max_length=2_000)
+    quote: str = Field(default="", max_length=2_000)
+
+    @field_validator("segment_ids", mode="before")
+    @classmethod
+    def normalize_segment_ids(cls, value: Any) -> list[int]:
+        """Bound over-broad model evidence without rejecting an otherwise usable result."""
+        if not isinstance(value, list):
+            return []
+        identifiers = list(dict.fromkeys(item for item in value if isinstance(item, int)))
+        if len(identifiers) <= 10:
+            return identifiers
+        return [*identifiers[:5], *identifiers[-5:]]
 
 
 class ExtractedProposal(BaseModel):
@@ -271,8 +282,15 @@ def merge_chunk_proposals(
             grounded = []
             for item in proposal.evidence:
                 referenced = [segment_map[index] for index in item.segment_ids if index in segment_map]
+                if not referenced:
+                    continue
+                quote = item.quote.strip()
+                if not quote:
+                    quote = " ".join(
+                        str(segment.get("text", "")).strip() for segment in referenced[:3]
+                    )[:2_000]
                 grounded.append({
-                    "quote": item.quote,
+                    "quote": quote,
                     "start_seconds": next(
                         (s.get("start") for s in referenced if s.get("start") is not None), None
                     ),
@@ -331,7 +349,7 @@ Rules:
 - Return only claims supported by the supplied source. Never invent missing details.
 - Prefer canonical spellings from the campaign guide.
 - Create one session_summary plus distinct typed findings when supported.
-- Return at most 20 concise findings for this source chunk; prioritize important new facts.
+- Return at most 8 concise findings for this source chunk; prioritize important new facts.
 - Evidence must quote the source and identify its bracketed segment numbers.
 - Mark secrets, uncertain identity, enemy plans, and unresolved questions as GM visibility.
 - Confidence measures source support, not narrative importance.
@@ -339,7 +357,8 @@ Rules:
 - Each proposal must contain: kind, title, body, aliases, evidence, confidence, visibility.
 - kind must be one of: session_summary, player_character, npc, monster, character, location, item, spell, creature, quest,
   faction, deity, rule, important_decision, unresolved_question.
-- Each evidence item must contain a segment_ids integer array and a non-empty quote.
+- Each evidence item must contain 1-3 specific segment_ids and a short exact quote from those
+  segments. Never cite an entire scene or emit a long consecutive range of segment IDs.
 - confidence is a number from 0 through 1. visibility is either "gm" or "player".
 
 Source segments:

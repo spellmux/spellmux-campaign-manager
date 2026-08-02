@@ -38,6 +38,7 @@ FROM base AS test
 USER root
 RUN python -m pip install --no-cache-dir ".[dev]"
 COPY tests ./tests
+COPY compose.yml ./compose.yml
 CMD ["pytest", "-q"]
 
 FROM base AS runtime
