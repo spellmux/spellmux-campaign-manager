@@ -111,10 +111,23 @@ def process_analysis_job(
             diarization_document.get("turns", []),
             cluster_resolutions(reviews),
         )
-    prompt, included = build_analysis_prompt(game_session, guide, segments, settings.analysis_max_input_chars)
-    result, response_metadata = (analyze or ollama_analyzer(settings))(
-        prompt, settings.analysis_model, AnalysisResult.model_json_schema()
+    chunk_limit = min(settings.analysis_max_input_chars, settings.analysis_chunk_chars)
+    prompts = build_analysis_prompts(
+        game_session, guide, segments, chunk_limit, settings.analysis_chunk_overlap_segments
     )
+    analyzer = analyze or ollama_analyzer(settings)
+    extracted_runs: list[tuple[list[ExtractedProposal], list[tuple[int, dict[str, Any]]]]] = []
+    response_metadata: list[dict[str, Any]] = []
+    for chunk_index, (prompt, included) in enumerate(prompts):
+        result, metadata = analyzer(prompt, settings.analysis_model, AnalysisResult.model_json_schema())
+        extracted_runs.append((result.proposals, included))
+        response_metadata.append({"chunk_index": chunk_index, **metadata})
+    merged = merge_chunk_proposals(extracted_runs)
+    if not merged:
+        raise ValueError(
+            "Analysis model returned no findings; the source was not marked complete. "
+            "Retry with a smaller source window or a more capable model."
+        )
 
     # A retry replaces only still-unreviewed proposals from the same source.
     replaceable = database.scalars(select(AnalysisProposal).where(
@@ -124,26 +137,87 @@ def process_analysis_job(
     for proposal in replaceable:
         if proposal.run_metadata.get("source_artifact_id") == str(source.id):
             database.delete(proposal)
-    segment_map = {index: segment for index, segment in included}
-    for extracted in result.proposals:
-        evidence = []
-        for item in extracted.evidence:
-            referenced = [segment_map[index] for index in item.segment_ids if index in segment_map]
-            evidence.append({
-                "quote": item.quote,
-                "artifact_id": str(source.id),
-                "start_seconds": next((s.get("start") for s in referenced if s.get("start") is not None), None),
-                "end_seconds": next((s.get("end") for s in reversed(referenced) if s.get("end") is not None), None),
-            })
+    for extracted, evidence in merged:
+        for item in evidence:
+            item["artifact_id"] = str(source.id)
         database.add(AnalysisProposal(
             session_id=game_session.id, kind=extracted.kind, title=extracted.title.strip(),
             body=extracted.body.strip(), aliases=list(dict.fromkeys(a.strip() for a in extracted.aliases if a.strip())),
             evidence=evidence, confidence=extracted.confidence, visibility=extracted.visibility,
             provider="ollama", model=settings.analysis_model,
-            run_metadata={"source_artifact_id": str(source.id), "job_id": str(job.id), **response_metadata},
+            run_metadata={
+                "source_artifact_id": str(source.id), "job_id": str(job.id),
+                "analysis_strategy": "overlapping_chunks", "chunk_count": len(prompts),
+                "responses": response_metadata,
+                **(response_metadata[0] if len(response_metadata) == 1 else {}),
+            },
             created_by_id=creator.id,
         ))
     database.commit()
+
+
+def build_analysis_prompts(
+    game_session: GameSession,
+    guide: list[CampaignGuideEntry],
+    segments: list[dict[str, Any]],
+    max_chars: int,
+    overlap_segments: int = 8,
+) -> list[tuple[str, list[tuple[int, dict[str, Any]]]]]:
+    """Build bounded prompts while retaining global source-segment identities."""
+    prompts = []
+    cursor = 0
+    while cursor < len(segments):
+        prompt, local_included = build_analysis_prompt(
+            game_session, guide, segments[cursor:], max_chars, start_index=cursor
+        )
+        prompts.append((prompt, local_included))
+        consumed = len(local_included)
+        if cursor + consumed >= len(segments):
+            break
+        effective_overlap = min(max(0, overlap_segments), max(0, consumed // 5))
+        cursor += max(1, consumed - effective_overlap)
+    return prompts
+
+
+def merge_chunk_proposals(
+    runs: list[tuple[list[ExtractedProposal], list[tuple[int, dict[str, Any]]]]]
+) -> list[tuple[ExtractedProposal, list[dict[str, object]]]]:
+    """Deterministically reduce chunk findings without discarding grounded evidence."""
+    merged: dict[tuple[str, str], tuple[ExtractedProposal, list[dict[str, object]]]] = {}
+    for proposals, included in runs:
+        segment_map = dict(included)
+        for proposal in proposals:
+            key = (
+                proposal.kind,
+                "session recap" if proposal.kind == "session_summary" else proposal.title.casefold().strip(),
+            )
+            grounded = []
+            for item in proposal.evidence:
+                referenced = [segment_map[index] for index in item.segment_ids if index in segment_map]
+                grounded.append({
+                    "quote": item.quote,
+                    "start_seconds": next(
+                        (s.get("start") for s in referenced if s.get("start") is not None), None
+                    ),
+                    "end_seconds": next(
+                        (s.get("end") for s in reversed(referenced) if s.get("end") is not None), None
+                    ),
+                })
+            if key not in merged:
+                merged[key] = (proposal.model_copy(deep=True), grounded)
+                continue
+            current, current_evidence = merged[key]
+            if proposal.body and proposal.body not in current.body:
+                current.body = f"{current.body}\n\n{proposal.body}".strip()
+            current.aliases = list(dict.fromkeys([*current.aliases, *proposal.aliases]))
+            current.confidence = max(current.confidence, proposal.confidence)
+            current.visibility = "gm" if "gm" in {current.visibility, proposal.visibility} else "player"
+            seen = {(item["quote"], item["start_seconds"], item["end_seconds"]) for item in current_evidence}
+            current_evidence.extend(
+                item for item in grounded
+                if (item["quote"], item["start_seconds"], item["end_seconds"]) not in seen
+            )
+    return list(merged.values())
 
 
 def _source_segments(document: Any) -> list[dict[str, Any]]:
@@ -159,6 +233,7 @@ def build_analysis_prompt(
     guide: list[CampaignGuideEntry],
     segments: list[dict[str, Any]],
     max_chars: int,
+    start_index: int = 0,
 ) -> tuple[str, list[tuple[int, dict[str, Any]]]]:
     guide_lines = [
         f"- {entry.kind}: {entry.canonical_name}; aliases={', '.join(entry.aliases) or 'none'}; notes={entry.notes}"
@@ -190,7 +265,7 @@ Source segments:
     remaining = max(0, max_chars - len(prefix))
     included: list[tuple[int, dict[str, Any]]] = []
     lines: list[str] = []
-    for index, segment in enumerate(segments):
+    for index, segment in enumerate(segments, start=start_index):
         timing = ""
         if segment.get("start") is not None:
             timing = f" {segment.get('start'):.2f}-{segment.get('end', segment.get('start')):.2f}s"
