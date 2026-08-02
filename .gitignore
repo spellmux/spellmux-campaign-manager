@@ -6,6 +6,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 data/
+/campaign_*.zip
 dist/
 build/
 *.egg-info/
