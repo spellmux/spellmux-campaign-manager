@@ -1,8 +1,7 @@
 """Initial accounts, campaigns, sessions, jobs, and authentication tokens."""
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 revision = "0001_initial"
 down_revision = None

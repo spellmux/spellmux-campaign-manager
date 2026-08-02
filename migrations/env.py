@@ -6,7 +6,6 @@ from sqlalchemy import engine_from_config, pool
 from campaign_manager.config import Settings
 from campaign_manager.models import Base
 
-
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
