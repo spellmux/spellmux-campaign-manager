@@ -6,3 +6,16 @@
 .settings-form input,.settings-form select,.settings-form textarea { width:100%; box-sizing:border-box; }
 .editor-actions { display:flex; flex-wrap:wrap; gap:.7rem; }
 .editor-error { color:#ff8f8f; }
+.guide-editor-view,.guide-entry-form { display:grid; gap:1rem; }
+.guide-toolbar,.guide-entry-heading,.editor-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; }
+.guide-entry-list { display:grid; gap:.85rem; }
+.guide-entry-card,.guide-entry-form,.confirm-panel,.guide-empty { border:1px solid #354052; border-radius:.7rem; padding:1rem; background:#151c27; }
+.guide-entry-card h3,.editor-heading h3 { margin:.2rem 0 0; }
+.guide-kind,.guide-visibility { color:#9eb9e5; font-size:.8rem; text-transform:uppercase; letter-spacing:.06em; }
+.guide-notes { white-space:pre-wrap; line-height:1.5; }
+.guide-fields-two { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1rem; }
+.guide-entry-form label { display:grid; gap:.35rem; color:#c7d8f5; }
+.guide-entry-form input,.guide-entry-form select,.guide-entry-form textarea { width:100%; box-sizing:border-box; }
+.confirm-panel { border-color:#8a4141; }
+.danger { background:#8d3030; border-color:#b74b4b; }
+@media (max-width:700px) { .guide-fields-two { grid-template-columns:1fr; } .guide-entry-heading,.editor-heading { flex-direction:column; } }
