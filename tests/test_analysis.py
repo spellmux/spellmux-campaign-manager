@@ -102,15 +102,16 @@ def _settings(tmp_path):
 
 
 def test_prompt_respects_input_limit(tmp_path) -> None:
+    max_chars = 2_000
     session = GameSession(title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
     guide = [CampaignGuideEntry(
         campaign_id=session.campaign_id, kind="location", canonical_name="Wonderland",
         aliases=[], notes="", visibility="gm", created_by_id=session.created_by_id,
     )]
     prompt, included = build_analysis_prompt(
-        session, guide, [{"start": index, "end": index + 1, "text": "x" * 40} for index in range(50)], 1_000,
+        session, guide, [{"start": index, "end": index + 1, "text": "x" * 40} for index in range(50)], max_chars,
     )
-    assert len(prompt) <= 1_000
+    assert len(prompt) <= max_chars
     assert 0 < len(included) < 50
 
 
