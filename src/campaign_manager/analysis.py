@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Callable
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -35,13 +35,31 @@ class ExtractedEvidence(BaseModel):
     segment_ids: list[int] = Field(default_factory=list, max_length=10)
     quote: str = Field(default="", max_length=2_000)
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_singular_segment_id(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or "segment_ids" in value or "segment_id" not in value:
+            return value
+        normalized = dict(value)
+        normalized["segment_ids"] = [normalized.pop("segment_id")]
+        return normalized
+
     @field_validator("segment_ids", mode="before")
     @classmethod
     def normalize_segment_ids(cls, value: Any) -> list[int]:
         """Bound over-broad model evidence without rejecting an otherwise usable result."""
         if not isinstance(value, list):
             return []
-        identifiers = list(dict.fromkeys(item for item in value if isinstance(item, int)))
+        identifiers = []
+        for item in value:
+            if isinstance(item, int):
+                identifier = item
+            elif isinstance(item, str) and item.strip().isdigit():
+                identifier = int(item.strip())
+            else:
+                continue
+            if identifier not in identifiers:
+                identifiers.append(identifier)
         if len(identifiers) <= 10:
             return identifiers
         return [*identifiers[:5], *identifiers[-5:]]
@@ -58,6 +76,16 @@ class ExtractedProposal(BaseModel):
     evidence: list[ExtractedEvidence] = Field(default_factory=list, max_length=20)
     confidence: float = Field(ge=0, le=1)
     visibility: Literal["gm", "player"] = "gm"
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def normalize_evidence_count(cls, value: Any) -> list[Any]:
+        """Keep representative evidence when a model cites every line in a scene."""
+        if not isinstance(value, list):
+            return []
+        if len(value) <= 20:
+            return value
+        return [*value[:10], *value[-10:]]
 
 
 class AnalysisResult(BaseModel):

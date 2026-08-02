@@ -257,6 +257,20 @@ def test_analysis_normalizes_overbroad_evidence_and_derives_missing_quote() -> N
     assert evidence[0]["end_seconds"] == 224.0
 
 
+def test_analysis_accepts_singular_string_ids_and_caps_evidence_entries() -> None:
+    proposal = ExtractedProposal.model_validate({
+        "kind": "session_summary", "title": "Session recap", "body": "The party talked.",
+        "aliases": [], "confidence": 0.8, "visibility": "player",
+        "evidence": [
+            {"segment_id": str(index), "quote": f"Line {index}."} for index in range(78)
+        ],
+    })
+
+    assert len(proposal.evidence) == 20
+    assert [item.segment_ids for item in proposal.evidence[:2]] == [[0], [1]]
+    assert [item.segment_ids for item in proposal.evidence[-2:]] == [[76], [77]]
+
+
 def test_prompt_includes_resolved_speaker_attribution(tmp_path) -> None:
     session = GameSession(title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
     prompt, _ = build_analysis_prompt(
