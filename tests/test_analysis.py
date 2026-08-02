@@ -119,6 +119,49 @@ def test_analysis_job_rejects_empty_model_result(tmp_path) -> None:
         assert database.scalar(select(AnalysisProposal)) is None
 
 
+def test_analysis_checkpoints_completed_chunks_before_later_failure(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, session_id = create_campaign_and_session(client, headers)
+    cues = "\n\n".join(
+        f"00:00:{index:02d}.000 --> 00:00:{index:02d}.900\nCaelen explores room {index}. "
+        + "Details " * 20
+        for index in range(30)
+    )
+    source = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/text",
+        headers=headers,
+        json={"kind": "transcript", "filename": "long.vtt", "content": f"WEBVTT\n\n{cues}"},
+    ).json()
+    queued = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis",
+        headers=headers,
+        json={"source_artifact_id": source["id"]},
+    ).json()
+    calls = 0
+
+    def fail_second_chunk(prompt, model, schema):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("truncated model response")
+        return AnalysisResult.model_validate({"proposals": [{
+            "kind": "location", "title": "First Room", "body": "Explored.",
+            "aliases": [], "confidence": 0.8, "visibility": "gm",
+            "evidence": [{"segment_ids": [0], "quote": "Caelen explores room 0."}],
+        }]}), {"eval_count": 10}
+
+    with session_factory()() as database:
+        job = database.get(Job, uuid.UUID(queued["id"]))
+        settings = replace(_settings(tmp_path), analysis_chunk_chars=2_200)
+        with pytest.raises(ValueError, match="truncated model response"):
+            process_analysis_job(database, settings, job, fail_second_chunk)
+        proposal = database.scalar(select(AnalysisProposal))
+        assert proposal.title == "First Room"
+        assert proposal.run_metadata["completed_chunks"] == 1
+        assert job.payload["analysis_progress"]["completed_chunks"] == 1
+
+
 def _settings(tmp_path):
     from campaign_manager.config import Settings
 
@@ -198,11 +241,13 @@ def test_prompt_includes_resolved_speaker_attribution(tmp_path) -> None:
     session = GameSession(title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
     prompt, _ = build_analysis_prompt(
         session, [], [{"start": 12.0, "end": 15.0, "speaker_name": "Rob", "text": "I open the door."}], 2_000,
+        speaker_context=["Rob plays Caelen (primary); notes=none"],
     )
 
     assert "Rob: I open the door." in prompt
+    assert "Rob plays Caelen (primary)" in prompt
     assert 'Return exactly one JSON object with a "proposals" array' in prompt
-    assert "session_summary, character, location" in prompt
+    assert "session_summary, player_character, npc, monster" in prompt
 
 
 def test_analysis_status_is_disabled_by_default(tmp_path) -> None:

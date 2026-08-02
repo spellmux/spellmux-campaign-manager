@@ -34,6 +34,7 @@ class Settings:
     analysis_timeout_seconds: int = 21_600
     analysis_max_input_chars: int = 240_000
     analysis_context_tokens: int = 65_536
+    analysis_max_output_tokens: int = 8_192
     analysis_chunk_chars: int = 32_000
     analysis_chunk_overlap_segments: int = 8
     otterwiki_repository_path: Path | None = None
@@ -71,6 +72,9 @@ class Settings:
             analysis_timeout_seconds=_integer_environment("CAMPAIGN_ANALYSIS_TIMEOUT_SECONDS", 21_600),
             analysis_max_input_chars=_integer_environment("CAMPAIGN_ANALYSIS_MAX_INPUT_CHARS", 240_000),
             analysis_context_tokens=_integer_environment("CAMPAIGN_ANALYSIS_CONTEXT_TOKENS", 65_536),
+            analysis_max_output_tokens=_integer_environment(
+                "CAMPAIGN_ANALYSIS_MAX_OUTPUT_TOKENS", 8_192
+            ),
             analysis_chunk_chars=_integer_environment("CAMPAIGN_ANALYSIS_CHUNK_CHARS", 32_000),
             analysis_chunk_overlap_segments=_integer_environment(
                 "CAMPAIGN_ANALYSIS_CHUNK_OVERLAP_SEGMENTS", 8
@@ -108,6 +112,7 @@ class Settings:
             "analysis_timeout_seconds": self.analysis_timeout_seconds,
             "analysis_max_input_chars": self.analysis_max_input_chars,
             "analysis_context_tokens": self.analysis_context_tokens,
+            "analysis_max_output_tokens": self.analysis_max_output_tokens,
             "analysis_chunk_chars": self.analysis_chunk_chars,
             "analysis_chunk_overlap_segments": self.analysis_chunk_overlap_segments,
             "otterwiki_publishing_configured": self.otterwiki_repository_path is not None,

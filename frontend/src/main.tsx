@@ -43,9 +43,22 @@ type ReviewState = {
 };
 type ReviewEvent = CustomEvent<ReviewState>;
 
+type Speaker = { id: string; display_name: string; notes: string };
+type SessionSummary = { id: string; title: string; session_date: string | null };
+type SpeakerAssignment = {
+  id: string; speaker_profile_id: string; speaker_name: string; guide_entry_id: string;
+  character_name: string; session_id: string | null; session_title: string | null;
+  is_primary: boolean; notes: string;
+};
+type SpeakersState = {
+  campaignId: string; role: string; speakers: Speaker[]; characters: GuideEntry[];
+  sessions: SessionSummary[]; assignments: SpeakerAssignment[];
+};
+type SpeakersEvent = CustomEvent<SpeakersState>;
+
 const guideKinds = [
-  "instruction", "character", "location", "faction", "item", "spell", "quest",
-  "creature", "deity", "rule", "pronunciation", "other",
+  "instruction", "player_character", "npc", "monster", "character", "creature", "location",
+  "faction", "item", "spell", "quest", "deity", "rule", "pronunciation", "other",
 ];
 
 const emptyGuideEntry: GuideEntry = {
@@ -327,6 +340,86 @@ function CampaignGuideEditor({ root }: { root: HTMLElement }) {
   );
 }
 
+function speakersFromRoot(root: HTMLElement): SpeakersState {
+  try {
+    return root.dataset.speakers
+      ? JSON.parse(root.dataset.speakers)
+      : { campaignId: "", role: "player", speakers: [], characters: [], sessions: [], assignments: [] };
+  } catch {
+    return { campaignId: "", role: "player", speakers: [], characters: [], sessions: [], assignments: [] };
+  }
+}
+
+function CampaignSpeakersEditor({ root }: { root: HTMLElement }) {
+  const [data, setData] = useState<SpeakersState>(() => speakersFromRoot(root));
+  const [speakerDraft, setSpeakerDraft] = useState<Speaker | null>(null);
+  const [assignmentDraft, setAssignmentDraft] = useState<Partial<SpeakerAssignment> | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ kind: "speaker" | "assignment"; id: string; name: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const receive = (event: Event) => setData((event as SpeakersEvent).detail);
+    window.addEventListener("campaign-manager:campaign-speakers", receive);
+    return () => window.removeEventListener("campaign-manager:campaign-speakers", receive);
+  }, []);
+
+  const refresh = () => window.dispatchEvent(new CustomEvent("campaign-manager:speakers-updated"));
+  const saveSpeaker = async (event: SubmitEvent) => {
+    event.preventDefault();
+    if (!speakerDraft?.display_name.trim()) return setError("Speaker name is required.");
+    setBusy(true); setError("");
+    try {
+      await apiRequest(
+        `/campaigns/${data.campaignId}/speakers${speakerDraft.id ? `/${speakerDraft.id}` : ""}`,
+        { method: speakerDraft.id ? "PUT" : "POST", body: JSON.stringify({ display_name: speakerDraft.display_name, notes: speakerDraft.notes }) },
+      );
+      setSpeakerDraft(null); refresh();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to save speaker."); }
+    finally { setBusy(false); }
+  };
+
+  const saveAssignment = async (event: SubmitEvent) => {
+    event.preventDefault();
+    if (!assignmentDraft?.speaker_profile_id || !assignmentDraft.guide_entry_id) return;
+    setBusy(true); setError("");
+    try {
+      const id = assignmentDraft.id;
+      await apiRequest(
+        `/campaigns/${data.campaignId}/speaker-character-assignments${id ? `/${id}` : ""}`,
+        { method: id ? "PUT" : "POST", body: JSON.stringify({
+          ...(!id ? { speaker_profile_id: assignmentDraft.speaker_profile_id } : {}),
+          guide_entry_id: assignmentDraft.guide_entry_id,
+          session_id: assignmentDraft.session_id || null,
+          is_primary: Boolean(assignmentDraft.is_primary), notes: assignmentDraft.notes || "",
+        }) },
+      );
+      setAssignmentDraft(null); refresh();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to save character assignment."); }
+    finally { setBusy(false); }
+  };
+
+  const remove = async () => {
+    if (!deleteTarget) return;
+    setBusy(true); setError("");
+    const path = deleteTarget.kind === "speaker"
+      ? `/campaigns/${data.campaignId}/speakers/${deleteTarget.id}`
+      : `/campaigns/${data.campaignId}/speaker-character-assignments/${deleteTarget.id}`;
+    try { await apiRequest(path, { method: "DELETE" }); setDeleteTarget(null); refresh(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Unable to delete item."); }
+    finally { setBusy(false); }
+  };
+
+  if (speakerDraft) return <form class="speaker-editor-form" onSubmit={saveSpeaker}><h3>{speakerDraft.id ? "Edit speaker" : "New speaker"}</h3><label>Person’s name<input value={speakerDraft.display_name} required autoFocus onInput={(event) => setSpeakerDraft({ ...speakerDraft, display_name: event.currentTarget.value })} /></label><label>Notes<textarea rows={6} value={speakerDraft.notes} placeholder="Player, GM, guest, pronunciation, or voice notes" onInput={(event) => setSpeakerDraft({ ...speakerDraft, notes: event.currentTarget.value })} /></label>{error && <p class="editor-error">{error}</p>}<div class="editor-actions"><button disabled={busy}>{busy ? "Saving…" : "Save speaker"}</button><button type="button" class="secondary" onClick={() => setSpeakerDraft(null)}>Cancel</button></div></form>;
+
+  if (assignmentDraft) {
+    const speaker = data.speakers.find((item) => item.id === assignmentDraft.speaker_profile_id);
+    return <form class="speaker-editor-form" onSubmit={saveAssignment}><div class="editor-heading"><h3>Connect {speaker?.display_name} to a Player Character</h3><span class="muted">Analysis treats this as guidance, not proof.</span></div>{data.characters.length ? <><label>Player Character<select required value={assignmentDraft.guide_entry_id || ""} onChange={(event) => setAssignmentDraft({ ...assignmentDraft, guide_entry_id: event.currentTarget.value })}><option value="">Choose a character</option>{data.characters.map((character) => <option value={character.id}>{character.canonical_name}{character.kind === "character" ? " (legacy type)" : ""}</option>)}</select></label><label>Scope<select value={assignmentDraft.session_id || ""} onChange={(event) => setAssignmentDraft({ ...assignmentDraft, session_id: event.currentTarget.value || null })}><option value="">Campaign default</option>{data.sessions.map((session) => <option value={session.id}>{session.session_date || "Undated"} — {session.title}</option>)}</select></label><label class="check-label"><input type="checkbox" checked={Boolean(assignmentDraft.is_primary)} onChange={(event) => setAssignmentDraft({ ...assignmentDraft, is_primary: event.currentTarget.checked })} /> Primary character for this scope</label><label>Assignment notes<textarea rows={4} value={assignmentDraft.notes || ""} placeholder="Optional context, such as a temporary character or guest appearance" onInput={(event) => setAssignmentDraft({ ...assignmentDraft, notes: event.currentTarget.value })} /></label></>:<div class="review-empty"><strong>No Player Characters are available</strong><span class="muted">Create or reclassify an entry as Player Character in the Campaign Guide first.</span></div>}{error && <p class="editor-error">{error}</p>}<div class="editor-actions">{data.characters.length > 0 && <button disabled={busy}>{busy ? "Saving…" : "Save assignment"}</button>}<button type="button" class="secondary" onClick={() => setAssignmentDraft(null)}>Cancel</button></div></form>;
+  }
+
+  return <div class="speaker-manager"><div class="guide-toolbar"><span class="muted">{data.speakers.length} identified {data.speakers.length === 1 ? "person" : "people"}</span><button type="button" onClick={() => setSpeakerDraft({ id: "", display_name: "", notes: "" })}>New speaker</button></div>{error && <p class="editor-error">{error}</p>}<div class="speaker-card-list">{data.speakers.map((speaker) => { const assignments = data.assignments.filter((item) => item.speaker_profile_id === speaker.id); return <article class="speaker-card" key={speaker.id}><div class="review-card-heading"><div><span class="guide-kind">Person</span><h3>{speaker.display_name}</h3></div><div class="editor-actions"><button type="button" class="secondary" onClick={() => setSpeakerDraft({ ...speaker })}>Edit</button><button type="button" class="danger secondary" onClick={() => setDeleteTarget({ kind: "speaker", id: speaker.id, name: speaker.display_name })}>Delete</button></div></div><p class="muted">{speaker.notes || "No speaker notes."}</p><div class="assignment-list">{assignments.map((assignment) => <div class="assignment-row" key={assignment.id}><div><strong>{assignment.character_name}</strong><span class="muted">{assignment.session_title || "Campaign default"}{assignment.is_primary ? " · primary" : ""}{assignment.notes ? ` · ${assignment.notes}` : ""}</span></div><div class="editor-actions"><button type="button" class="secondary" onClick={() => setAssignmentDraft({ ...assignment })}>Edit</button><button type="button" class="secondary" onClick={() => setDeleteTarget({ kind: "assignment", id: assignment.id, name: `${speaker.display_name} → ${assignment.character_name}` })}>Remove</button></div></div>)}{!assignments.length && <span class="muted">No Player Character connected yet.</span>}</div><button type="button" class="secondary" onClick={() => setAssignmentDraft({ speaker_profile_id: speaker.id, guide_entry_id: "", session_id: null, is_primary: assignments.length === 0, notes: "" })}>Connect Player Character</button></article>; })}</div>{deleteTarget && <div class="confirm-panel" role="alertdialog"><strong>{deleteTarget.kind === "speaker" ? `Delete ${deleteTarget.name}?` : `Remove ${deleteTarget.name}?`}</strong><p>{deleteTarget.kind === "speaker" ? "This also removes their character assignments and speaker-review links." : "This stops using the character relationship as analysis context."}</p><div class="editor-actions"><button class="danger" type="button" disabled={busy} onClick={remove}>{busy ? "Deleting…" : "Confirm"}</button><button type="button" class="secondary" onClick={() => setDeleteTarget(null)}>Cancel</button></div></div>}</div>;
+}
+
 function reviewFromRoot(root: HTMLElement): ReviewState {
   try {
     return root.dataset.review
@@ -451,5 +544,7 @@ const root = document.getElementById("campaign-settings-editor");
 if (root) render(<CampaignSettings root={root} />, root);
 const guideRoot = document.getElementById("campaign-guide-editor");
 if (guideRoot) render(<CampaignGuideEditor root={guideRoot} />, guideRoot);
+const speakersRoot = document.getElementById("campaign-speakers-editor");
+if (speakersRoot) render(<CampaignSpeakersEditor root={speakersRoot} />, speakersRoot);
 const reviewRoot = document.getElementById("proposal-list");
 if (reviewRoot) render(<MorningReviewEditor root={reviewRoot} />, reviewRoot);

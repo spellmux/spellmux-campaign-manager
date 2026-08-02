@@ -120,3 +120,53 @@ def test_comparison_endpoint_aligns_native_transcript_with_vtt(tmp_path) -> None
     assert compared.status_code == 200
     assert compared.json()["similarity"] == 0.5
     assert any(item["kind"] == "replace" for item in compared.json()["passages"])
+
+
+def test_speaker_can_be_assigned_to_player_character_but_not_npc(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, session_id = create_campaign_and_session(client, headers)
+    speaker = client.post(
+        f"/api/v1/campaigns/{campaign_id}/speakers", headers=headers,
+        json={"display_name": "Rob", "notes": "Player"},
+    ).json()
+    player_character = client.post(
+        f"/api/v1/campaigns/{campaign_id}/guide", headers=headers,
+        json={"kind": "player_character", "canonical_name": "Caelen", "visibility": "player"},
+    ).json()
+    npc = client.post(
+        f"/api/v1/campaigns/{campaign_id}/guide", headers=headers,
+        json={"kind": "npc", "canonical_name": "Mock Turtle", "visibility": "gm"},
+    ).json()
+
+    assigned = client.post(
+        f"/api/v1/campaigns/{campaign_id}/speaker-character-assignments",
+        headers=headers,
+        json={
+            "speaker_profile_id": speaker["id"],
+            "guide_entry_id": player_character["id"],
+            "session_id": session_id,
+            "is_primary": True,
+            "notes": "Current character",
+        },
+    )
+    invalid = client.post(
+        f"/api/v1/campaigns/{campaign_id}/speaker-character-assignments",
+        headers=headers,
+        json={"speaker_profile_id": speaker["id"], "guide_entry_id": npc["id"]},
+    )
+    listed = client.get(
+        f"/api/v1/campaigns/{campaign_id}/speaker-character-assignments", headers=headers
+    )
+
+    assert assigned.status_code == 201
+    assert assigned.json()["speaker_name"] == "Rob"
+    assert assigned.json()["character_name"] == "Caelen"
+    assert assigned.json()["session_title"] == "Arrival at the Crossroads"
+    assert invalid.status_code == 422
+    assert "Player Characters" in invalid.json()["detail"]
+    assert [item["id"] for item in listed.json()] == [assigned.json()["id"]]
+    assert client.delete(
+        f"/api/v1/campaigns/{campaign_id}/speaker-character-assignments/{assigned.json()['id']}",
+        headers=headers,
+    ).status_code == 204

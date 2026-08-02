@@ -182,6 +182,9 @@ class TranscriptRevisionCreate(BaseModel):
 GUIDE_KINDS = {
     "instruction",
     "character",
+    "player_character",
+    "npc",
+    "monster",
     "location",
     "faction",
     "item",
@@ -244,7 +247,7 @@ class CampaignGuideResponse(BaseModel):
 
 
 ANALYSIS_KINDS = {
-    "session_summary", "character", "location", "item", "spell", "creature",
+    "session_summary", "character", "player_character", "npc", "monster", "location", "item", "spell", "creature",
     "quest", "faction", "deity", "rule", "important_decision", "unresolved_question",
 }
 
@@ -377,6 +380,34 @@ class SpeakerProfileResponse(BaseModel):
     id: uuid.UUID
     campaign_id: uuid.UUID
     display_name: str
+    notes: str
+    created_at: datetime
+
+
+class SpeakerCharacterAssignmentCreate(BaseModel):
+    speaker_profile_id: uuid.UUID
+    guide_entry_id: uuid.UUID
+    session_id: uuid.UUID | None = None
+    is_primary: bool = False
+    notes: str = Field(default="", max_length=20_000)
+
+
+class SpeakerCharacterAssignmentUpdate(BaseModel):
+    guide_entry_id: uuid.UUID
+    session_id: uuid.UUID | None = None
+    is_primary: bool = False
+    notes: str = Field(default="", max_length=20_000)
+
+
+class SpeakerCharacterAssignmentResponse(BaseModel):
+    id: uuid.UUID
+    speaker_profile_id: uuid.UUID
+    speaker_name: str
+    guide_entry_id: uuid.UUID
+    character_name: str
+    session_id: uuid.UUID | None
+    session_title: str | None
+    is_primary: bool
     notes: str
     created_at: datetime
 

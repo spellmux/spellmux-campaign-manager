@@ -37,6 +37,7 @@ from campaign_manager.models import (
     Job,
     ProcessingControl,
     SessionPublication,
+    SpeakerCharacterAssignment,
     SpeakerProfile,
     SpeakerReview,
     User,
@@ -78,6 +79,9 @@ from campaign_manager.schemas import (
     SessionCreate,
     SessionResponse,
     SessionUpdate,
+    SpeakerCharacterAssignmentCreate,
+    SpeakerCharacterAssignmentResponse,
+    SpeakerCharacterAssignmentUpdate,
     SpeakerProfileCreate,
     SpeakerProfileResponse,
     SpeakerProfileUpdate,
@@ -472,6 +476,192 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.delete(profile)
         database.commit()
 
+    def speaker_assignment_response(
+        assignment: SpeakerCharacterAssignment,
+        speaker: SpeakerProfile,
+        character: CampaignGuideEntry,
+        game_session: GameSession | None,
+    ) -> SpeakerCharacterAssignmentResponse:
+        return SpeakerCharacterAssignmentResponse(
+            id=assignment.id,
+            speaker_profile_id=assignment.speaker_profile_id,
+            speaker_name=speaker.display_name,
+            guide_entry_id=assignment.guide_entry_id,
+            character_name=character.canonical_name,
+            session_id=assignment.session_id,
+            session_title=game_session.title if game_session else None,
+            is_primary=assignment.is_primary,
+            notes=assignment.notes,
+            created_at=assignment.created_at,
+        )
+
+    def validate_speaker_character_scope(
+        database: Session,
+        campaign_id: uuid.UUID,
+        speaker_profile_id: uuid.UUID,
+        guide_entry_id: uuid.UUID,
+        session_id: uuid.UUID | None,
+    ) -> tuple[SpeakerProfile, CampaignGuideEntry, GameSession | None]:
+        speaker = database.scalar(select(SpeakerProfile).where(
+            SpeakerProfile.id == speaker_profile_id,
+            SpeakerProfile.campaign_id == campaign_id,
+        ))
+        if speaker is None:
+            raise HTTPException(status_code=404, detail="Speaker not found")
+        character = database.scalar(select(CampaignGuideEntry).where(
+            CampaignGuideEntry.id == guide_entry_id,
+            CampaignGuideEntry.campaign_id == campaign_id,
+            CampaignGuideEntry.is_active.is_(True),
+        ))
+        if character is None:
+            raise HTTPException(status_code=404, detail="Campaign Guide entry not found")
+        if character.kind not in {"player_character", "character"}:
+            raise HTTPException(
+                status_code=422, detail="Speakers can only be assigned to Player Characters"
+            )
+        game_session = None
+        if session_id is not None:
+            game_session = database.scalar(select(GameSession).where(
+                GameSession.id == session_id,
+                GameSession.campaign_id == campaign_id,
+            ))
+            if game_session is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+        return speaker, character, game_session
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/speaker-character-assignments",
+        response_model=list[SpeakerCharacterAssignmentResponse],
+        tags=["speaker-review"],
+    )
+    def list_speaker_character_assignments(
+        campaign_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[SpeakerCharacterAssignmentResponse]:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        rows = database.execute(
+            select(SpeakerCharacterAssignment, SpeakerProfile, CampaignGuideEntry, GameSession)
+            .join(SpeakerProfile, SpeakerProfile.id == SpeakerCharacterAssignment.speaker_profile_id)
+            .join(CampaignGuideEntry, CampaignGuideEntry.id == SpeakerCharacterAssignment.guide_entry_id)
+            .outerjoin(GameSession, GameSession.id == SpeakerCharacterAssignment.session_id)
+            .where(SpeakerProfile.campaign_id == campaign_id)
+            .order_by(SpeakerProfile.display_name, SpeakerCharacterAssignment.is_primary.desc())
+        ).all()
+        return [speaker_assignment_response(*row) for row in rows]
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/speaker-character-assignments",
+        response_model=SpeakerCharacterAssignmentResponse,
+        status_code=201,
+        tags=["speaker-review"],
+    )
+    def create_speaker_character_assignment(
+        campaign_id: uuid.UUID,
+        request: SpeakerCharacterAssignmentCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> SpeakerCharacterAssignmentResponse:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        speaker, character, game_session = validate_speaker_character_scope(
+            database, campaign_id, request.speaker_profile_id,
+            request.guide_entry_id, request.session_id,
+        )
+        if request.is_primary:
+            existing = database.scalars(select(SpeakerCharacterAssignment).where(
+                SpeakerCharacterAssignment.speaker_profile_id == speaker.id,
+                SpeakerCharacterAssignment.session_id == request.session_id,
+            )).all()
+            for assignment in existing:
+                assignment.is_primary = False
+        assignment = SpeakerCharacterAssignment(
+            speaker_profile_id=speaker.id,
+            guide_entry_id=character.id,
+            session_id=request.session_id,
+            is_primary=request.is_primary,
+            notes=request.notes.strip(),
+            created_by_id=user.id,
+        )
+        database.add(assignment)
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="Speaker assignment already exists") from exc
+        database.refresh(assignment)
+        return speaker_assignment_response(assignment, speaker, character, game_session)
+
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}/speaker-character-assignments/{assignment_id}",
+        response_model=SpeakerCharacterAssignmentResponse,
+        tags=["speaker-review"],
+    )
+    def update_speaker_character_assignment(
+        campaign_id: uuid.UUID,
+        assignment_id: uuid.UUID,
+        request: SpeakerCharacterAssignmentUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> SpeakerCharacterAssignmentResponse:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        assignment = database.scalar(
+            select(SpeakerCharacterAssignment)
+            .join(SpeakerProfile, SpeakerProfile.id == SpeakerCharacterAssignment.speaker_profile_id)
+            .where(
+                SpeakerCharacterAssignment.id == assignment_id,
+                SpeakerProfile.campaign_id == campaign_id,
+            )
+        )
+        if assignment is None:
+            raise HTTPException(status_code=404, detail="Speaker assignment not found")
+        speaker, character, game_session = validate_speaker_character_scope(
+            database, campaign_id, assignment.speaker_profile_id,
+            request.guide_entry_id, request.session_id,
+        )
+        if request.is_primary:
+            existing = database.scalars(select(SpeakerCharacterAssignment).where(
+                SpeakerCharacterAssignment.speaker_profile_id == speaker.id,
+                SpeakerCharacterAssignment.session_id == request.session_id,
+                SpeakerCharacterAssignment.id != assignment.id,
+            )).all()
+            for other in existing:
+                other.is_primary = False
+        assignment.guide_entry_id = character.id
+        assignment.session_id = request.session_id
+        assignment.is_primary = request.is_primary
+        assignment.notes = request.notes.strip()
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="Speaker assignment already exists") from exc
+        database.refresh(assignment)
+        return speaker_assignment_response(assignment, speaker, character, game_session)
+
+    @app.delete(
+        "/api/v1/campaigns/{campaign_id}/speaker-character-assignments/{assignment_id}",
+        status_code=204,
+    )
+    def delete_speaker_character_assignment(
+        campaign_id: uuid.UUID,
+        assignment_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> None:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        assignment = database.scalar(
+            select(SpeakerCharacterAssignment)
+            .join(SpeakerProfile, SpeakerProfile.id == SpeakerCharacterAssignment.speaker_profile_id)
+            .where(
+                SpeakerCharacterAssignment.id == assignment_id,
+                SpeakerProfile.campaign_id == campaign_id,
+            )
+        )
+        if assignment is None:
+            raise HTTPException(status_code=404, detail="Speaker assignment not found")
+        database.delete(assignment)
+        database.commit()
+
     @app.get(
         "/api/v1/campaigns/{campaign_id}/sessions",
         response_model=list[SessionResponse],
@@ -689,7 +879,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         proposal = analysis_proposal(database, campaign_id, session_id, proposal_id)
         if proposal.status != "proposed":
             raise HTTPException(status_code=409, detail="Proposal was already reviewed")
-        guide_kinds = {"character", "location", "item", "spell", "creature", "quest", "faction", "deity", "rule"}
+        guide_kinds = {"character", "player_character", "npc", "monster", "location", "item", "spell", "creature", "quest", "faction", "deity", "rule"}
         if proposal.kind in guide_kinds:
             entry = database.scalar(select(CampaignGuideEntry).where(
                 CampaignGuideEntry.campaign_id == campaign_id,

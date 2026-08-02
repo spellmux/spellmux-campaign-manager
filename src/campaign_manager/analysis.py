@@ -23,6 +23,8 @@ from campaign_manager.models import (
     CampaignGuideEntry,
     GameSession,
     Job,
+    SpeakerCharacterAssignment,
+    SpeakerProfile,
     SpeakerReview,
     User,
 )
@@ -36,7 +38,7 @@ class ExtractedEvidence(BaseModel):
 
 class ExtractedProposal(BaseModel):
     kind: Literal[
-        "session_summary", "character", "location", "item", "spell", "creature",
+        "session_summary", "character", "player_character", "npc", "monster", "location", "item", "spell", "creature",
         "quest", "faction", "deity", "rule", "important_decision", "unresolved_question",
     ]
     title: str = Field(min_length=1, max_length=200)
@@ -48,7 +50,7 @@ class ExtractedProposal(BaseModel):
 
 
 class AnalysisResult(BaseModel):
-    proposals: list[ExtractedProposal] = Field(default_factory=list, max_length=200)
+    proposals: list[ExtractedProposal] = Field(default_factory=list, max_length=25)
 
 
 Analyze = Callable[[str, str, dict[str, Any]], tuple[AnalysisResult, dict[str, Any]]]
@@ -112,9 +114,30 @@ def process_analysis_job(
             diarization_document.get("turns", []),
             cluster_resolutions(reviews),
         )
+    assignment_rows = database.execute(
+        select(SpeakerCharacterAssignment, SpeakerProfile, CampaignGuideEntry)
+        .join(SpeakerProfile, SpeakerProfile.id == SpeakerCharacterAssignment.speaker_profile_id)
+        .join(CampaignGuideEntry, CampaignGuideEntry.id == SpeakerCharacterAssignment.guide_entry_id)
+        .where(
+            SpeakerProfile.campaign_id == game_session.campaign_id,
+            (
+                SpeakerCharacterAssignment.session_id.is_(None)
+                | (SpeakerCharacterAssignment.session_id == game_session.id)
+            ),
+        )
+        .order_by(SpeakerProfile.display_name, SpeakerCharacterAssignment.is_primary.desc())
+    ).all()
+    speaker_context = [
+        f"{speaker.display_name} plays {character.canonical_name}"
+        f"{' (primary)' if assignment.is_primary else ''}"
+        f"{' for this session' if assignment.session_id else ''}"
+        f"; notes={assignment.notes or 'none'}"
+        for assignment, speaker, character in assignment_rows
+    ]
     chunk_limit = min(settings.analysis_max_input_chars, settings.analysis_chunk_chars)
     prompts = build_analysis_prompts(
-        game_session, guide, segments, chunk_limit, settings.analysis_chunk_overlap_segments
+        game_session, guide, segments, chunk_limit, settings.analysis_chunk_overlap_segments,
+        speaker_context,
     )
     started = time.monotonic()
     job.payload = {
@@ -144,6 +167,12 @@ def process_analysis_job(
                 "estimated_seconds_remaining": round(remaining),
             },
         }
+        checkpoint = merge_chunk_proposals(extracted_runs)
+        if checkpoint:
+            replace_analysis_proposals(
+                database, game_session, source, creator, job, checkpoint,
+                response_metadata, len(prompts), settings.analysis_model,
+            )
         database.commit()
     merged = merge_chunk_proposals(extracted_runs)
     if not merged:
@@ -152,7 +181,29 @@ def process_analysis_job(
             "Retry with a smaller source window or a more capable model."
         )
 
-    # A retry replaces only still-unreviewed proposals from the same source.
+    job.payload = {
+        **job.payload,
+        "analysis_progress": {
+            **job.payload.get("analysis_progress", {}),
+            "stage": "complete", "percent": 100, "estimated_seconds_remaining": 0,
+            "finding_count": len(merged),
+        },
+    }
+    database.commit()
+
+
+def replace_analysis_proposals(
+    database: Session,
+    game_session: GameSession,
+    source: Artifact,
+    creator: User,
+    job: Job,
+    merged: list[tuple[ExtractedProposal, list[dict[str, object]]]],
+    response_metadata: list[dict[str, Any]],
+    chunk_count: int,
+    model: str,
+) -> None:
+    """Checkpoint the latest merged findings after every successful chunk."""
     replaceable = database.scalars(select(AnalysisProposal).where(
         AnalysisProposal.session_id == game_session.id,
         AnalysisProposal.status == "proposed",
@@ -167,24 +218,17 @@ def process_analysis_job(
             session_id=game_session.id, kind=extracted.kind, title=extracted.title.strip(),
             body=extracted.body.strip(), aliases=list(dict.fromkeys(a.strip() for a in extracted.aliases if a.strip())),
             evidence=evidence, confidence=extracted.confidence, visibility=extracted.visibility,
-            provider="ollama", model=settings.analysis_model,
+            provider="ollama", model=model,
             run_metadata={
                 "source_artifact_id": str(source.id), "job_id": str(job.id),
-                "analysis_strategy": "overlapping_chunks", "chunk_count": len(prompts),
+                "analysis_strategy": "overlapping_chunks", "chunk_count": chunk_count,
+                "completed_chunks": len(response_metadata),
                 "responses": response_metadata,
                 **(response_metadata[0] if len(response_metadata) == 1 else {}),
             },
             created_by_id=creator.id,
         ))
-    job.payload = {
-        **job.payload,
-        "analysis_progress": {
-            **job.payload.get("analysis_progress", {}),
-            "stage": "complete", "percent": 100, "estimated_seconds_remaining": 0,
-            "finding_count": len(merged),
-        },
-    }
-    database.commit()
+    database.flush()
 
 
 def build_analysis_prompts(
@@ -193,13 +237,15 @@ def build_analysis_prompts(
     segments: list[dict[str, Any]],
     max_chars: int,
     overlap_segments: int = 8,
+    speaker_context: list[str] | None = None,
 ) -> list[tuple[str, list[tuple[int, dict[str, Any]]]]]:
     """Build bounded prompts while retaining global source-segment identities."""
     prompts = []
     cursor = 0
     while cursor < len(segments):
         prompt, local_included = build_analysis_prompt(
-            game_session, guide, segments[cursor:], max_chars, start_index=cursor
+            game_session, guide, segments[cursor:], max_chars,
+            start_index=cursor, speaker_context=speaker_context,
         )
         prompts.append((prompt, local_included))
         consumed = len(local_included)
@@ -265,6 +311,7 @@ def build_analysis_prompt(
     segments: list[dict[str, Any]],
     max_chars: int,
     start_index: int = 0,
+    speaker_context: list[str] | None = None,
 ) -> tuple[str, list[tuple[int, dict[str, Any]]]]:
     guide_lines = [
         f"- {entry.kind}: {entry.canonical_name}; aliases={', '.join(entry.aliases) or 'none'}; notes={entry.notes}"
@@ -277,16 +324,20 @@ Session description: {game_session.description or 'none'}
 Campaign truth and spelling guide:
 {chr(10).join(guide_lines) or '- none'}
 
+Player-to-character context (guidance, not proof that every utterance is in character):
+{chr(10).join(f'- {line}' for line in (speaker_context or [])) or '- none'}
+
 Rules:
 - Return only claims supported by the supplied source. Never invent missing details.
 - Prefer canonical spellings from the campaign guide.
 - Create one session_summary plus distinct typed findings when supported.
+- Return at most 20 concise findings for this source chunk; prioritize important new facts.
 - Evidence must quote the source and identify its bracketed segment numbers.
 - Mark secrets, uncertain identity, enemy plans, and unresolved questions as GM visibility.
 - Confidence measures source support, not narrative importance.
 - Return exactly one JSON object with a "proposals" array and no surrounding commentary.
 - Each proposal must contain: kind, title, body, aliases, evidence, confidence, visibility.
-- kind must be one of: session_summary, character, location, item, spell, creature, quest,
+- kind must be one of: session_summary, player_character, npc, monster, character, location, item, spell, creature, quest,
   faction, deity, rule, important_decision, unresolved_question.
 - Each evidence item must contain a segment_ids integer array and a non-empty quote.
 - confidence is a number from 0 through 1. visibility is either "gm" or "player".
@@ -324,7 +375,11 @@ def ollama_analyzer(settings: Settings) -> Analyze:
             # across local models and still fails closed on malformed output.
             "format": "json",
             "think": False,
-            "options": {"temperature": 0, "num_ctx": settings.analysis_context_tokens},
+            "options": {
+                "temperature": 0,
+                "num_ctx": settings.analysis_context_tokens,
+                "num_predict": settings.analysis_max_output_tokens,
+            },
         }).encode("utf-8")
         request = urllib.request.Request(
             f"{settings.analysis_base_url}/api/chat", data=payload,

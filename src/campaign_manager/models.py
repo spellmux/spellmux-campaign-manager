@@ -163,6 +163,33 @@ class SpeakerProfile(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class SpeakerCharacterAssignment(Base):
+    __tablename__ = "speaker_character_assignments"
+    __table_args__ = (
+        UniqueConstraint(
+            "speaker_profile_id", "guide_entry_id", "session_id",
+            name="uq_speaker_character_scope",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    speaker_profile_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("speaker_profiles.id", ondelete="CASCADE"), index=True
+    )
+    guide_entry_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("campaign_guide_entries.id", ondelete="CASCADE")
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    created_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class AnalysisProposal(Base):
     """A machine- or human-authored session fact awaiting GM judgment."""
 

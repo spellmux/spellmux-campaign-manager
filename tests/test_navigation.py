@@ -34,6 +34,6 @@ def test_navigation_markup_has_unique_element_ids() -> None:
 def test_session_speaker_review_routes_to_campaign_speaker_management() -> None:
     html = index_html()
 
-    assert 'id="campaign-speaker-form"' in html
+    assert 'id="campaign-speakers-editor"' in html
     assert 'id="manage-campaign-speakers"' in html
     assert 'id="speaker-profile-form"' not in html
