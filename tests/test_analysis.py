@@ -1,3 +1,4 @@
+import json
 import uuid
 from dataclasses import replace
 
@@ -14,6 +15,7 @@ from campaign_manager.analysis import (
     consolidate_analysis,
     merge_chunk_proposals,
     ollama_status,
+    parse_analysis_content,
     process_analysis_job,
 )
 from campaign_manager.database import session_factory
@@ -121,7 +123,7 @@ def test_analysis_job_rejects_empty_model_result(tmp_path) -> None:
         assert database.scalar(select(AnalysisProposal)) is None
 
 
-def test_analysis_checkpoints_completed_chunks_before_later_failure(tmp_path) -> None:
+def test_analysis_fails_only_when_every_chunk_fails(tmp_path) -> None:
     client = configured_client(tmp_path)
     headers = {"Authorization": f"Bearer {login(client)}"}
     campaign_id, session_id = create_campaign_and_session(client, headers)
@@ -142,26 +144,22 @@ def test_analysis_checkpoints_completed_chunks_before_later_failure(tmp_path) ->
     ).json()
     calls = 0
 
-    def fail_second_chunk(prompt, model, schema):
+    def fail_every_chunk(prompt, model, schema):
         nonlocal calls
         calls += 1
-        if calls == 2:
-            raise ValueError("truncated model response")
-        return AnalysisResult.model_validate({"proposals": [{
-            "kind": "location", "title": "First Room", "body": "Explored.",
-            "aliases": [], "confidence": 0.8, "visibility": "gm",
-            "evidence": [{"segment_ids": [0], "quote": "Caelen explores room 0."}],
-        }]}), {"eval_count": 10}
+        raise ValueError("truncated model response")
 
     with session_factory()() as database:
         job = database.get(Job, uuid.UUID(queued["id"]))
         settings = replace(_settings(tmp_path), analysis_chunk_chars=2_200)
-        with pytest.raises(ValueError, match="truncated model response"):
-            process_analysis_job(database, settings, job, fail_second_chunk)
-        proposal = database.scalar(select(AnalysisProposal))
-        assert proposal.title == "First Room"
-        assert proposal.run_metadata["completed_chunks"] == 1
-        assert job.payload["analysis_progress"]["completed_chunks"] == 1
+        # Individual chunk failures are survivable, but a run that salvaged
+        # nothing must still fail loudly instead of marking the source complete.
+        with pytest.raises(ValueError, match="returned no findings"):
+            process_analysis_job(database, settings, job, fail_every_chunk)
+        assert calls > 1
+        assert database.scalar(select(AnalysisProposal)) is None
+        assert job.payload["analysis_progress"]["failed_chunks"] == calls
+        assert "truncated model response" in job.payload["chunk_failures"][0]["error"]
 
 
 def _settings(tmp_path):
@@ -313,6 +311,98 @@ def test_analysis_normalizes_compact_evidence_and_misplaced_visibility() -> None
         "evidence": [934, "935", 936],
     })
     assert compact_ids.evidence[0].segment_ids == [934, 935, 936]
+
+
+def test_truncated_model_output_salvages_complete_proposals() -> None:
+    # Reproduces a real Sharn response: eval_count hit num_predict and the JSON
+    # stopped mid-string, which previously failed the whole 36-chunk job.
+    content = (
+        '{\n "proposals": [\n'
+        '  {"kind": "location", "title": "Tea Party Estate", "body": "Behind a picket fence.",'
+        '   "aliases": [], "confidence": 0.9, "visibility": "player",'
+        '   "evidence": [{"segment_ids": [12], "quote": "the estate"}]},\n'
+        '  {"kind": "scene", "title": "Arrival", "body": "The party arrives.",'
+        '   "aliases": [], "confidence": 0.8, "visibility": "player",'
+        '   "evidence": [{"segment_ids": [14], "quote": "we go in"}]},\n'
+        '  {"kind": "npc", "title": "Hatter", "body": "A host who never finish'
+    )
+
+    result, diagnostics = parse_analysis_content(content)
+
+    assert [proposal.title for proposal in result.proposals] == ["Tea Party Estate", "Arrival"]
+    assert diagnostics["recovered_from_truncation"] is True
+
+
+def test_unusable_proposal_is_dropped_without_losing_the_others() -> None:
+    # The float evidence below is what failed Wonderland Session 02 in production:
+    # the model cited start/end seconds instead of segment ids.
+    content = json.dumps({"proposals": [
+        {"kind": "scene", "title": "Rabbit chase", "body": "They give chase.",
+         "aliases": [], "confidence": 0.9, "visibility": "player",
+         "evidence": [0, 126.43, 128.49]},
+        {"kind": "npc", "title": "White Rabbit", "body": "Impatient guide.",
+         "aliases": [], "confidence": 0.8, "visibility": "gm",
+         "evidence": [{"segment_ids": [7], "quote": "hurry up"}]},
+        {"kind": "not_a_kind", "title": "Unusable", "body": "", "aliases": [],
+         "confidence": 0.5, "visibility": "gm", "evidence": []},
+    ]})
+
+    result, diagnostics = parse_analysis_content(content)
+
+    assert [proposal.title for proposal in result.proposals] == ["Rabbit chase", "White Rabbit"]
+    assert diagnostics["dropped_proposals"] == 1
+    # The whole number is kept as a segment id; the fractional values are carried
+    # as the cited time range rather than becoming bogus segment references.
+    evidence = result.proposals[0].evidence[0]
+    assert evidence.segment_ids == [0]
+    assert evidence.cited_seconds == [126.43, 128.49]
+
+
+def test_analysis_completes_when_some_chunks_fail(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, session_id = create_campaign_and_session(client, headers)
+    cues = "\n\n".join(
+        f"00:00:{index:02d}.000 --> 00:00:{index:02d}.900\nCaelen explores room {index}. "
+        + "Details " * 20
+        for index in range(30)
+    )
+    source = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/text",
+        headers=headers,
+        json={"kind": "transcript", "filename": "long.vtt", "content": f"WEBVTT\n\n{cues}"},
+    ).json()
+    queued = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis",
+        headers=headers, json={"source_artifact_id": source["id"]},
+    )
+    assert queued.status_code == 202
+    calls = []
+
+    def flaky_analyze(prompt, model, schema):
+        calls.append(prompt)
+        if len(calls) == 1:
+            raise ValueError("Ollama returned truncated JSON")
+        return AnalysisResult.model_validate({"proposals": [{
+            "kind": "scene", "title": f"Scene {len(calls)}", "body": "Something happened.",
+            "aliases": [], "confidence": 0.9, "visibility": "player",
+            "evidence": [{"segment_ids": [0], "quote": "Caelen explores room 0."}],
+        }]}), {"eval_count": 20}
+
+    with session_factory()() as database:
+        job = database.scalar(select(Job).where(Job.kind == "analysis"))
+        settings = replace(_settings(tmp_path), analysis_chunk_chars=2_200)
+        process_analysis_job(database, settings, job, flaky_analyze)
+
+        assert len(calls) > 1
+        progress = job.payload["analysis_progress"]
+        assert progress["stage"] == "complete"
+        assert progress["failed_chunks"] == 1
+        assert job.payload["chunk_failures"][0]["chunk_index"] == 0
+        proposals = database.scalars(select(AnalysisProposal).where(
+            AnalysisProposal.session_id == job.session_id
+        )).all()
+        assert proposals
 
 
 def test_consolidation_separates_story_from_meta_and_merges_entities() -> None:

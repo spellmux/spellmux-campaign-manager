@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -34,9 +34,32 @@ from campaign_manager.models import (
 from campaign_manager.review import read_artifact
 
 
+def _evidence_number(item: Any) -> float | None:
+    """Return item as a number when it is one, so bare id/second lists are usable."""
+    if isinstance(item, bool):
+        return None
+    if isinstance(item, int | float):
+        return float(item)
+    if isinstance(item, str):
+        try:
+            return float(item.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _validates_as_evidence(item: Any) -> bool:
+    try:
+        ExtractedEvidence.model_validate(item)
+    except ValidationError:
+        return False
+    return True
+
+
 class ExtractedEvidence(BaseModel):
     segment_ids: list[int] = Field(default_factory=list, max_length=10)
     quote: str = Field(default="", max_length=2_000)
+    cited_seconds: list[float] = Field(default_factory=list, max_length=2)
 
     @model_validator(mode="before")
     @classmethod
@@ -169,18 +192,30 @@ class ExtractedProposal(BaseModel):
     @field_validator("evidence", mode="before")
     @classmethod
     def normalize_evidence_count(cls, value: Any) -> list[Any]:
-        """Keep representative evidence when a model cites every line in a scene."""
+        """Keep representative evidence when a model cites every line in a scene.
+
+        Unparseable entries are dropped rather than failing the whole proposal. A
+        finding with weaker evidence is still worth reviewing, and rejecting it
+        would discard a chunk's other findings with it.
+        """
         if not isinstance(value, list):
             return []
-        if value and all(
-            isinstance(item, int) or (isinstance(item, str) and item.strip().isdigit())
-            for item in value
-        ):
-            identifiers = [int(item) for item in value]
-            return [{"segment_ids": identifiers[:10], "quote": ""}]
-        if len(value) <= 20:
-            return value
-        return [*value[:10], *value[-10:]]
+        numbers = [_evidence_number(item) for item in value]
+        if value and all(number is not None for number in numbers):
+            # Bare number lists are segment ids, or start/end seconds when the
+            # model cites the timing shown beside each segment. Only whole
+            # numbers can be segment ids; fractional seconds are resolved later
+            # against the segment map, so they are carried as a time range.
+            identifiers = [int(number) for number in numbers if float(number).is_integer()]
+            seconds = [float(number) for number in numbers if not float(number).is_integer()]
+            entry: dict[str, Any] = {"segment_ids": identifiers[:10], "quote": ""}
+            if seconds:
+                entry["cited_seconds"] = [min(seconds), max(seconds)]
+            return [entry]
+        usable = [item for item in value if _validates_as_evidence(item)]
+        if len(usable) <= 20:
+            return usable
+        return [*usable[:10], *usable[-10:]]
 
 
 class AnalysisResult(BaseModel):
@@ -188,6 +223,88 @@ class AnalysisResult(BaseModel):
 
 
 Analyze = Callable[[str, str, dict[str, Any]], tuple[AnalysisResult, dict[str, Any]]]
+
+
+def parse_analysis_content(content: str) -> tuple[AnalysisResult, dict[str, Any]]:
+    """Turn raw model output into proposals, keeping whatever is usable.
+
+    Small local models stop mid-JSON when they reach the output token limit, and
+    occasionally emit an unexpected shape for one proposal. Either would abort a
+    whole multi-chunk job if the response were parsed all-or-nothing, so complete
+    proposals are salvaged from partial output and individually invalid ones are
+    dropped. Diagnostics record what was lost so a thin chunk is visible instead
+    of silent.
+    """
+    diagnostics: dict[str, Any] = {}
+    try:
+        payload: Any = json.loads(content)
+    except ValueError:
+        payload = {"proposals": _salvage_proposal_objects(content)}
+        diagnostics["recovered_from_truncation"] = True
+    if isinstance(payload, list):
+        payload = {"proposals": payload}
+    if not isinstance(payload, dict):
+        raise TypeError("Analysis response was not a JSON object")
+    candidates = payload.get("proposals")
+    if not isinstance(candidates, list):
+        candidates = []
+    proposals: list[ExtractedProposal] = []
+    dropped = 0
+    for item in candidates:
+        try:
+            proposals.append(ExtractedProposal.model_validate(item))
+        except ValidationError:
+            dropped += 1
+    if dropped:
+        diagnostics["dropped_proposals"] = dropped
+    if not proposals:
+        raise ValueError(
+            "Analysis response contained no usable proposals; "
+            f"discarded {dropped} malformed entr{'y' if dropped == 1 else 'ies'}"
+        )
+    return AnalysisResult(proposals=proposals[:40]), diagnostics
+
+
+def _salvage_proposal_objects(content: str) -> list[dict[str, Any]]:
+    """Extract the complete objects from a proposals array cut off mid-write."""
+    labelled = content.find('"proposals"')
+    opening = content.find("[", labelled if labelled != -1 else 0)
+    if opening == -1:
+        return []
+    objects: list[dict[str, Any]] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index in range(opening, len(content)):
+        character = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    candidate = json.loads(content[start:index + 1])
+                except ValueError:
+                    candidate = None
+                if isinstance(candidate, dict):
+                    objects.append(candidate)
+                start = -1
+        elif character == "]" and depth == 0:
+            break
+    return objects
 
 
 def ollama_status(settings: Settings, timeout: float = 3) -> dict[str, Any]:
@@ -293,13 +410,29 @@ def process_analysis_job(
     analyzer = analyze or ollama_analyzer(analysis_settings)
     extracted_runs: list[tuple[list[ExtractedProposal], list[tuple[int, dict[str, Any]]]]] = []
     response_metadata: list[dict[str, Any]] = []
+    chunk_failures: list[dict[str, Any]] = []
     if resume_proposals:
         extracted_runs.append((resume_proposals, list(enumerate(segments))))
     else:
         for chunk_index, (prompt, included) in enumerate(prompts):
-            result, metadata = analyzer(
-                prompt, analysis_settings.analysis_model, AnalysisResult.model_json_schema()
-            )
+            try:
+                result, metadata = analyzer(
+                    prompt, analysis_settings.analysis_model, AnalysisResult.model_json_schema()
+                )
+            except Exception as exc:  # noqa: BLE001 - one chunk must not lose the rest
+                # A single unusable chunk previously failed the entire job, so a
+                # 36-chunk session was only as reliable as its worst response.
+                chunk_failures.append({"chunk_index": chunk_index, "error": str(exc)[:500]})
+                job.payload = {
+                    **job.payload,
+                    "analysis_progress": {
+                        **job.payload.get("analysis_progress", {}),
+                        "failed_chunks": len(chunk_failures),
+                    },
+                    "chunk_failures": chunk_failures[-20:],
+                }
+                database.commit()
+                continue
             normalized = canonicalize_character_kinds(
                 result.proposals, guide, player_character_ids
             )
@@ -326,12 +459,17 @@ def process_analysis_job(
             database.commit()
     merged = merge_chunk_proposals(extracted_runs)
     if not merged:
+        detail = (
+            f" All {len(chunk_failures)} chunk(s) failed; first error: "
+            f"{chunk_failures[0]['error']}" if chunk_failures else ""
+        )
         raise ValueError(
             "Analysis model returned no findings; the source was not marked complete. "
-            "Retry with a smaller source window or a more capable model."
+            "Retry with a smaller source window or a more capable model." + detail
         )
 
     raw_proposals = [proposal for proposals, _included in extracted_runs for proposal in proposals]
+    consolidation_error: str | None = None
     if len(raw_proposals) > 1:
         job.payload = {
             **job.payload,
@@ -350,25 +488,35 @@ def process_analysis_job(
                     analysis_settings.analysis_max_output_tokens, 6_144
                 ),
             ))
-        consolidated, consolidation_metadata = consolidate_analysis(
-            game_session, guide, speaker_context, raw_proposals, consolidation_analyzer,
-            analysis_settings.analysis_model,
-            min(analysis_settings.analysis_max_input_chars, analysis_settings.analysis_context_tokens),
-        )
-        consolidated.proposals = canonicalize_character_kinds(
-            consolidated.proposals, guide, player_character_ids
-        )
-        response_metadata.extend(consolidation_metadata)
-        consolidated_merged = merge_chunk_proposals([(
-            consolidated.proposals, list(enumerate(segments)),
-        )])
-        if consolidated_merged:
-            merged = consolidated_merged
-            replace_analysis_proposals(
-                database, game_session, source, creator, job, merged,
-                response_metadata, len(prompts), analysis_settings.analysis_model,
+        try:
+            consolidated, consolidation_metadata = consolidate_analysis(
+                game_session, guide, speaker_context, raw_proposals, consolidation_analyzer,
+                analysis_settings.analysis_model,
+                min(
+                    analysis_settings.analysis_max_input_chars,
+                    analysis_settings.analysis_context_tokens,
+                ),
             )
-            database.commit()
+        except Exception as exc:  # noqa: BLE001 - keep the extracted findings
+            # Editorial consolidation is an improvement pass over findings that are
+            # already checkpointed. Losing the whole run because the editor would
+            # not produce a recap wastes every chunk that did succeed.
+            consolidation_error = str(exc)[:500]
+        else:
+            consolidated.proposals = canonicalize_character_kinds(
+                consolidated.proposals, guide, player_character_ids
+            )
+            response_metadata.extend(consolidation_metadata)
+            consolidated_merged = merge_chunk_proposals([(
+                consolidated.proposals, list(enumerate(segments)),
+            )])
+            if consolidated_merged:
+                merged = consolidated_merged
+                replace_analysis_proposals(
+                    database, game_session, source, creator, job, merged,
+                    response_metadata, len(prompts), analysis_settings.analysis_model,
+                )
+                database.commit()
 
     job.payload = {
         **job.payload,
@@ -376,6 +524,8 @@ def process_analysis_job(
             **job.payload.get("analysis_progress", {}),
             "stage": "complete", "percent": 100, "estimated_seconds_remaining": 0,
             "finding_count": len(merged), "raw_finding_count": len(raw_proposals),
+            "failed_chunks": len(chunk_failures),
+            "consolidation_error": consolidation_error,
         },
     }
     database.commit()
@@ -1019,9 +1169,9 @@ def ollama_analyzer(settings: Settings) -> Analyze:
         content = envelope.get("message", {}).get("content")
         if not isinstance(content, str):
             raise TypeError("Ollama response did not contain message content")
-        result = AnalysisResult.model_validate_json(content)
+        result, diagnostics = parse_analysis_content(content)
         metadata = {key: envelope[key] for key in (
             "created_at", "done_reason", "total_duration", "load_duration", "prompt_eval_count", "eval_count"
         ) if key in envelope}
-        return result, metadata
+        return result, {**metadata, **diagnostics}
     return analyze
