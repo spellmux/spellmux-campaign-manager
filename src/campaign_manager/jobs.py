@@ -13,6 +13,36 @@ HEAVY_JOB_KINDS = {"transcription", "diarization", "analysis", "image_generation
 COMPUTE_LANE_CONTROL = "__compute_lane__"
 
 
+def recover_orphaned_jobs(database: Session, supported_kinds: Collection[str]) -> list[Job]:
+    """Requeue jobs a stopped worker left marked running.
+
+    claim_next_job only claims queued rows, so a job interrupted by a restart or
+    crash stays running forever and blocks the heavy compute lane until someone
+    requeues it by hand. A worker calls this once at startup, when it is by
+    definition not processing anything.
+
+    This assumes one worker per job kind, which the reference deployment
+    satisfies: the starting worker is the only one serving its kinds, so a
+    running job of those kinds has no live worker. Running two workers for the
+    same kind would let a restart requeue work still in progress elsewhere.
+    Long jobs do not touch their row while working, so staleness cannot be used
+    to tell the two cases apart without a heartbeat.
+    """
+    if not supported_kinds:
+        return []
+    orphaned = list(database.scalars(
+        select(Job).where(
+            Job.status == JobStatus.RUNNING.value,
+            Job.kind.in_(set(supported_kinds)),
+        ).order_by(Job.created_at, Job.id)
+    ))
+    for job in orphaned:
+        job.status = JobStatus.QUEUED.value
+        job.updated_at = utc_now()
+    database.commit()
+    return orphaned
+
+
 def claim_next_job(database: Session, supported_kinds: Collection[str]) -> Job | None:
     if not supported_kinds:
         return None
