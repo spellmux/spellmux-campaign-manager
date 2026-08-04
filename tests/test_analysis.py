@@ -7,6 +7,8 @@ from sqlalchemy import select
 from test_auth_campaigns import configured_client, create_campaign_and_session, login
 
 from campaign_manager.analysis import (
+    ANALYSIS_RESPONSE_SCHEMA,
+    PROPOSAL_KINDS,
     AnalysisResult,
     ExtractedProposal,
     build_analysis_prompt,
@@ -14,6 +16,7 @@ from campaign_manager.analysis import (
     canonicalize_character_kinds,
     consolidate_analysis,
     merge_chunk_proposals,
+    ollama_analyzer,
     ollama_status,
     parse_analysis_content,
     process_analysis_job,
@@ -331,6 +334,93 @@ def test_truncated_model_output_salvages_complete_proposals() -> None:
 
     assert [proposal.title for proposal in result.proposals] == ["Tea Party Estate", "Arrival"]
     assert diagnostics["recovered_from_truncation"] is True
+
+
+def test_recap_keyed_by_kind_instead_of_proposals_is_recovered() -> None:
+    # The real narrative-section response from Sharn: a finished recap returned as
+    # paragraphs under the section's kind, which was previously discarded whole.
+    content = json.dumps({"session_summary": [
+        "The session opened with the party arriving at The Cozy Landing Zone.",
+        "Investigative efforts turned toward the mysterious White Rabbit.",
+    ]})
+
+    result, diagnostics = parse_analysis_content(content)
+
+    assert diagnostics["recovered_from_kind_keys"] is True
+    assert len(result.proposals) == 1
+    recap = result.proposals[0]
+    assert recap.kind == "session_summary"
+    assert recap.lane == "story"
+    # Paragraphs become one recap, not one finding each.
+    assert recap.body.count("\n\n") == 1
+    assert "White Rabbit" in recap.body
+
+
+def test_kind_keyed_lists_and_plurals_become_individual_proposals() -> None:
+    content = json.dumps({
+        "scenes": ["The party gives chase. It ends badly."],
+        "npcs": [{"title": "Mayor Nez", "body": "The mayor.", "confidence": 0.7}],
+        "unrelated_key": ["ignored"],
+    })
+
+    result, _diagnostics = parse_analysis_content(content)
+
+    by_kind = {proposal.kind: proposal for proposal in result.proposals}
+    assert set(by_kind) == {"scene", "npc"}
+    # A bare string carries no title, so the leading sentence becomes one.
+    assert by_kind["scene"].title == "The party gives chase."
+    assert by_kind["npc"].title == "Mayor Nez"
+
+
+def test_response_schema_is_flat_enough_for_grammar_compilation() -> None:
+    serialized = json.dumps(ANALYSIS_RESPONSE_SCHEMA)
+
+    # Ollama rejects the $defs/$ref form Pydantic emits for nested evidence.
+    assert "$ref" not in serialized
+    assert "$defs" not in serialized
+    assert "anyOf" not in serialized
+    item = ANALYSIS_RESPONSE_SCHEMA["properties"]["proposals"]["items"]
+    assert item["properties"]["evidence"]["items"]["properties"]["segment_ids"] == {
+        "type": "array", "items": {"type": "integer"},
+    }
+    # The enum must track the model's own kinds rather than a second hand-kept list.
+    assert set(item["properties"]["kind"]["enum"]) == set(PROPOSAL_KINDS)
+    assert "session_summary" in PROPOSAL_KINDS
+
+
+def test_analyzer_sends_the_schema_as_the_ollama_format(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "message": {"content": json.dumps({"proposals": [{
+                    "kind": "scene", "title": "Arrival", "body": "They arrive.",
+                    "aliases": [], "confidence": 0.9, "visibility": "player",
+                    "evidence": [{"segment_ids": [1], "quote": "we arrive"}],
+                }]})},
+                "done_reason": "stop", "eval_count": 12,
+            }).encode()
+
+    def fake_urlopen(request, timeout=None):
+        captured["body"] = json.loads(request.data.decode())
+        return FakeResponse()
+
+    monkeypatch.setattr("campaign_manager.analysis.urllib.request.urlopen", fake_urlopen)
+    settings = replace(_settings(tmp_path), analysis_base_url="http://sharn:11434")
+
+    result, metadata = ollama_analyzer(settings)("prompt", "m", ANALYSIS_RESPONSE_SCHEMA)
+
+    assert captured["body"]["format"] == ANALYSIS_RESPONSE_SCHEMA
+    assert captured["body"]["format"] != "json"
+    assert [proposal.title for proposal in result.proposals] == ["Arrival"]
+    assert metadata["eval_count"] == 12
 
 
 def test_unusable_proposal_is_dropped_without_losing_the_others() -> None:

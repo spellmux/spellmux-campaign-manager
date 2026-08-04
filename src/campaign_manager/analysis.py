@@ -10,7 +10,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import select
@@ -32,6 +32,27 @@ from campaign_manager.models import (
     User,
 )
 from campaign_manager.review import read_artifact
+
+KIND_ALIASES = {
+    "event": "scene", "scene_event": "scene", "moment": "memorable_moment",
+    "summary": "session_summary", "recap": "session_summary",
+    "story_thread": "unresolved_question", "question": "unresolved_question",
+    "task": "follow_up", "todo": "follow_up", "rule_question": "rule",
+    "entity": "character",
+}
+
+
+def _resolved_kind(key: Any) -> str | None:
+    """Map a model-supplied kind or container key onto a known proposal kind."""
+    if not isinstance(key, str):
+        return None
+    candidate = key.strip().casefold().replace(" ", "_").replace("-", "_")
+    for name in (candidate, candidate.removesuffix("s"), candidate.removesuffix("es")):
+        if name in PROPOSAL_KINDS:
+            return name
+        if name in KIND_ALIASES:
+            return KIND_ALIASES[name]
+    return None
 
 
 def _evidence_number(item: Any) -> float | None:
@@ -143,15 +164,8 @@ class ExtractedProposal(BaseModel):
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
-        kind_aliases = {
-            "event": "scene", "scene_event": "scene", "moment": "memorable_moment",
-            "summary": "session_summary", "recap": "session_summary",
-            "story_thread": "unresolved_question", "question": "unresolved_question",
-            "task": "follow_up", "todo": "follow_up", "rule_question": "rule",
-            "entity": "character",
-        }
-        if normalized.get("kind") in kind_aliases:
-            normalized["kind"] = kind_aliases[normalized["kind"]]
+        if normalized.get("kind") in KIND_ALIASES:
+            normalized["kind"] = KIND_ALIASES[normalized["kind"]]
         if normalized.get("lane") in {"gm", "player"}:
             normalized.setdefault("visibility", normalized["lane"])
             normalized.pop("lane", None)
@@ -224,6 +238,49 @@ class AnalysisResult(BaseModel):
 
 Analyze = Callable[[str, str, dict[str, Any]], tuple[AnalysisResult, dict[str, Any]]]
 
+# Derived from the model so the sampling grammar cannot drift from validation.
+PROPOSAL_KINDS: tuple[str, ...] = get_args(ExtractedProposal.model_fields["kind"].annotation)
+
+# Ollama compiles the requested format into a sampling grammar, which makes the
+# wrong envelope or a non-integer segment id structurally impossible rather than
+# something to repair afterwards. Pydantic's own schema is rejected because it
+# describes nested evidence through $defs/$ref, so this is written flat and
+# deliberately avoids $ref, combinators, and length or range constraints. The
+# lenient parser is retained: grammars cannot prevent an output token limit from
+# cutting a response short.
+ANALYSIS_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "proposals": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": list(PROPOSAL_KINDS)},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "aliases": {"type": "array", "items": {"type": "string"}},
+                    "evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "segment_ids": {"type": "array", "items": {"type": "integer"}},
+                                "quote": {"type": "string"},
+                            },
+                            "required": ["segment_ids", "quote"],
+                        },
+                    },
+                    "confidence": {"type": "number"},
+                    "visibility": {"type": "string", "enum": ["gm", "player"]},
+                },
+                "required": ["kind", "title", "body", "evidence", "confidence", "visibility"],
+            },
+        },
+    },
+    "required": ["proposals"],
+}
+
 
 def parse_analysis_content(content: str) -> tuple[AnalysisResult, dict[str, Any]]:
     """Turn raw model output into proposals, keeping whatever is usable.
@@ -246,8 +303,10 @@ def parse_analysis_content(content: str) -> tuple[AnalysisResult, dict[str, Any]
     if not isinstance(payload, dict):
         raise TypeError("Analysis response was not a JSON object")
     candidates = payload.get("proposals")
-    if not isinstance(candidates, list):
-        candidates = []
+    if not isinstance(candidates, list) or not candidates:
+        candidates = _proposals_from_kind_keys(payload)
+        if candidates:
+            diagnostics["recovered_from_kind_keys"] = True
     proposals: list[ExtractedProposal] = []
     dropped = 0
     for item in candidates:
@@ -263,6 +322,44 @@ def parse_analysis_content(content: str) -> tuple[AnalysisResult, dict[str, Any]
             f"discarded {dropped} malformed entr{'y' if dropped == 1 else 'ies'}"
         )
     return AnalysisResult(proposals=proposals[:40]), diagnostics
+
+
+def _proposals_from_kind_keys(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Recover proposals from a response keyed by kind instead of "proposals".
+
+    A model asked for one section reliably answers with the section's kind as the
+    top-level key, for example {"session_summary": ["paragraph", ...]}. The
+    content is usable; only the envelope is wrong, and discarding it threw away
+    finished recaps.
+    """
+    recovered: list[dict[str, Any]] = []
+    for key, value in payload.items():
+        kind = _resolved_kind(key)
+        if kind is None:
+            continue
+        entries = value if isinstance(value, list) else [value]
+        texts = [item for item in entries if isinstance(item, str) and item.strip()]
+        if texts:
+            if kind == "session_summary":
+                # Paragraph arrays are one recap, not one finding per paragraph.
+                recovered.append({"kind": kind, "title": "Session recap",
+                                  "body": "\n\n".join(text.strip() for text in texts)})
+            else:
+                recovered.extend(
+                    {"kind": kind, "title": _title_from_text(text), "body": text.strip()}
+                    for text in texts
+                )
+        for item in entries:
+            if isinstance(item, dict):
+                recovered.append({"kind": kind, **item})
+    return recovered
+
+
+def _title_from_text(text: str) -> str:
+    """Derive a title for a bare string entry, which carries no title of its own."""
+    head = text.strip().split("\n", 1)[0]
+    sentence = re.split(r"(?<=[.!?])\s", head, maxsplit=1)[0]
+    return (sentence if len(sentence) <= 200 else f"{sentence[:197]}...") or "Untitled"
 
 
 def _salvage_proposal_objects(content: str) -> list[dict[str, Any]]:
@@ -417,7 +514,7 @@ def process_analysis_job(
         for chunk_index, (prompt, included) in enumerate(prompts):
             try:
                 result, metadata = analyzer(
-                    prompt, analysis_settings.analysis_model, AnalysisResult.model_json_schema()
+                    prompt, analysis_settings.analysis_model, ANALYSIS_RESPONSE_SCHEMA
                 )
             except Exception as exc:  # noqa: BLE001 - one chunk must not lose the rest
                 # A single unusable chunk previously failed the entire job, so a
@@ -832,7 +929,7 @@ def _finalize_analysis_sections(
         prompt = _section_consolidation_prompt(
             game_session, guide, speaker_context, group_name, instruction, candidates
         )
-        result, response = analyzer(prompt, model, AnalysisResult.model_json_schema())
+        result, response = analyzer(prompt, model, ANALYSIS_RESPONSE_SCHEMA)
         if group_name == "threads":
             result.proposals = [
                 proposal for proposal in result.proposals
@@ -846,7 +943,7 @@ def _finalize_analysis_sections(
                 "kind=session_summary. Return that recap first, followed by concise scene entries."
             )
             retry_result, retry_response = analyzer(
-                retry_prompt, model, AnalysisResult.model_json_schema()
+                retry_prompt, model, ANALYSIS_RESPONSE_SCHEMA
             )
             result.proposals = [*retry_result.proposals, *result.proposals]
             response = {**response, "retry": retry_response}
@@ -857,7 +954,7 @@ def _finalize_analysis_sections(
                 "major event or consequence. Do not spend the recap only on the opening scene."
             )
             coverage_result, coverage_response = analyzer(
-                coverage_prompt, model, AnalysisResult.model_json_schema()
+                coverage_prompt, model, ANALYSIS_RESPONSE_SCHEMA
             )
             if any(proposal.kind == "session_summary" for proposal in coverage_result.proposals):
                 # The wider recap supersedes the narrow one. Keeping both would not publish two
@@ -1145,10 +1242,11 @@ def ollama_analyzer(settings: Settings) -> Analyze:
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            # Ollama's schema-to-grammar compiler rejects some valid Pydantic
-            # schemas. JSON mode plus strict Pydantic validation is portable
-            # across local models and still fails closed on malformed output.
-            "format": "json",
+            # Constrain sampling to the schema so the model cannot emit the wrong
+            # envelope or a non-integer segment id in the first place. The schema
+            # is written flat because Ollama's grammar compiler rejects the
+            # $defs/$ref form that Pydantic generates.
+            "format": schema,
             "think": False,
             "options": {
                 "temperature": 0,
