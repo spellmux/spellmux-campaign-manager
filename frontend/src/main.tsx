@@ -33,6 +33,7 @@ type GuideEvent = CustomEvent<GuideState>;
 type Evidence = { quote: string; start_seconds: number | null; end_seconds: number | null };
 type Proposal = {
   id: string; kind: string; title: string; body: string; aliases: string[];
+  lane: "story" | "meta";
   evidence: Evidence[]; confidence: number | null; visibility: "gm" | "player";
   status: "proposed" | "approved" | "rejected"; provider: string; model: string;
 };
@@ -463,7 +464,7 @@ function MorningReviewEditor({ root }: { root: HTMLElement }) {
     try {
       await apiRequest(
         `/campaigns/${review.campaignId}/sessions/${review.sessionId}/analysis-proposals/${draft.id}`,
-        { method: "PUT", body: JSON.stringify({ title: draft.title, body: draft.body, aliases: draft.aliases.map((alias) => alias.trim()).filter(Boolean), visibility: draft.visibility }) },
+        { method: "PUT", body: JSON.stringify({ title: draft.title, body: draft.body, lane: draft.lane, aliases: draft.aliases.map((alias) => alias.trim()).filter(Boolean), visibility: draft.visibility }) },
       );
       setDraft(null);
       window.dispatchEvent(new CustomEvent("campaign-manager:analysis-updated"));
@@ -501,6 +502,7 @@ function MorningReviewEditor({ root }: { root: HTMLElement }) {
         <label>Title<input value={draft.title} maxLength={200} required autoFocus onInput={(event) => updateDraft("title", event.currentTarget.value)} /></label>
         <label>Summary or description<textarea value={draft.body} maxLength={50000} rows={14} onInput={(event) => updateDraft("body", event.currentTarget.value)} /></label>
         <label>Aliases<input value={draft.aliases.join(", ")} onInput={(event) => updateDraft("aliases", event.currentTarget.value.split(","))} /></label>
+        <label>Section<select value={draft.lane} onChange={(event) => updateDraft("lane", event.currentTarget.value as "story" | "meta")}><option value="story">Story</option><option value="meta">Table &amp; follow-up</option></select></label>
         <label>Visibility<select value={draft.visibility} onChange={(event) => updateDraft("visibility", event.currentTarget.value as "gm" | "player")}><option value="gm">GM only</option><option value="player">Players</option></select></label>
         {draft.evidence.length > 0 && <EvidenceList evidence={draft.evidence} />}
         {error && <p class="editor-error" role="alert">{error}</p>}
@@ -511,20 +513,22 @@ function MorningReviewEditor({ root }: { root: HTMLElement }) {
 
   const pending = review.proposals.filter((proposal) => proposal.status === "proposed");
   const emptyRun = review.latestJob?.status === "succeeded" && review.proposals.length === 0;
+  const cards = (proposals: Proposal[]) => proposals.map((proposal) => (
+    <article class={`review-card review-${proposal.status}`} key={proposal.id}>
+      <div class="review-card-heading"><div><span class="guide-kind">{proposal.kind.replaceAll("_", " ")}</span><h3>{proposal.title}</h3></div><div class="review-badges"><span>{proposal.visibility === "gm" ? "GM only" : "Players"}</span><span>{proposal.status}</span>{proposal.confidence != null && <span>{Math.round(proposal.confidence * 100)}%</span>}</div></div>
+      <p class="review-body">{proposal.body || "No description supplied."}</p>
+      {proposal.aliases.length > 0 && <p class="muted">Aliases: {proposal.aliases.join(", ")}</p>}
+      <EvidenceList evidence={proposal.evidence} />
+      {canEdit && proposal.status === "proposed" && <div class="editor-actions"><button type="button" class="secondary" disabled={busy.includes(proposal.id)} onClick={() => setDraft({ ...proposal, aliases: [...proposal.aliases], evidence: [...proposal.evidence] })}>Edit</button><button type="button" disabled={busy.includes(proposal.id)} onClick={() => decide([proposal], "approve")}>Approve</button><button type="button" class="secondary" disabled={busy.includes(proposal.id)} onClick={() => decide([proposal], "reject")}>Reject</button></div>}
+    </article>
+  ));
   return (
     <div class="morning-review-editor">
       {canEdit && pending.length > 0 && <div class="review-toolbar"><strong>{pending.length} finding{pending.length === 1 ? "" : "s"} need review</strong><div class="editor-actions"><button type="button" onClick={() => decide(pending, "approve")} disabled={busy.length > 0}>Approve all</button><button type="button" class="secondary" onClick={() => decide(pending, "reject")} disabled={busy.length > 0}>Reject all</button></div></div>}
       {error && <p class="editor-error" role="alert">{error}</p>}
       {!visible.length && <div class="review-empty"><strong>{emptyRun ? "Analysis produced no findings" : review.filter === "proposed" ? "Nothing needs review" : "No matching findings"}</strong><span class="muted">{emptyRun ? "Run analysis again with another source or model." : review.filter === "proposed" ? "Generated findings will appear here when analysis completes." : "Choose another filter."}</span></div>}
-      <div class="review-card-list">{visible.map((proposal) => (
-        <article class={`review-card review-${proposal.status}`} key={proposal.id}>
-          <div class="review-card-heading"><div><span class="guide-kind">{proposal.kind.replaceAll("_", " ")}</span><h3>{proposal.title}</h3></div><div class="review-badges"><span>{proposal.visibility === "gm" ? "GM only" : "Players"}</span><span>{proposal.status}</span>{proposal.confidence != null && <span>{Math.round(proposal.confidence * 100)}%</span>}</div></div>
-          <p class="review-body">{proposal.body || "No description supplied."}</p>
-          {proposal.aliases.length > 0 && <p class="muted">Aliases: {proposal.aliases.join(", ")}</p>}
-          <EvidenceList evidence={proposal.evidence} />
-          {canEdit && proposal.status === "proposed" && <div class="editor-actions"><button type="button" class="secondary" disabled={busy.includes(proposal.id)} onClick={() => setDraft({ ...proposal, aliases: [...proposal.aliases], evidence: [...proposal.evidence] })}>Edit</button><button type="button" disabled={busy.includes(proposal.id)} onClick={() => decide([proposal], "approve")}>Approve</button><button type="button" class="secondary" disabled={busy.includes(proposal.id)} onClick={() => decide([proposal], "reject")}>Reject</button></div>}
-        </article>
-      ))}</div>
+      {visible.some((proposal) => proposal.lane === "story") && <section><div class="editor-heading"><div><span class="guide-kind">Story</span><h3>Session story</h3></div><span class="muted">Recap, scenes, moments, entities, and story threads</span></div><div class="review-card-list">{cards(visible.filter((proposal) => proposal.lane === "story"))}</div></section>}
+      {visible.some((proposal) => proposal.lane === "meta") && <section><div class="editor-heading"><div><span class="guide-kind">Meta</span><h3>Table &amp; follow-up</h3></div><span class="muted">Rules, research, to-dos, scheduling, and technical notes</span></div><div class="review-card-list">{cards(visible.filter((proposal) => proposal.lane === "meta"))}</div></section>}
     </div>
   );
 }
