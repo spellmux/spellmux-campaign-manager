@@ -145,6 +145,36 @@ class CampaignGuideEntry(Base):
     )
 
 
+class CampaignGuideFact(Base):
+    """A sourced, reviewable piece of lore attached to a canonical guide entry."""
+
+    __tablename__ = "campaign_guide_facts"
+    __table_args__ = (Index("ix_campaign_guide_facts_entry", "guide_entry_id", "status"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    guide_entry_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("campaign_guide_entries.id", ondelete="CASCADE"), index=True
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_proposal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("analysis_proposals.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    category: Mapped[str] = mapped_column(String(40), default="session_detail")
+    value: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="canonical")
+    confidence: Mapped[float | None] = mapped_column(nullable=True)
+    visibility: Mapped[str] = mapped_column(String(20), default="gm")
+    created_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class SpeakerProfile(Base):
     __tablename__ = "speaker_profiles"
     __table_args__ = (
@@ -201,6 +231,7 @@ class AnalysisProposal(Base):
         ForeignKey("game_sessions.id", ondelete="CASCADE"), index=True
     )
     kind: Mapped[str] = mapped_column(String(40))
+    lane: Mapped[str] = mapped_column(String(20), default="story")
     title: Mapped[str] = mapped_column(String(200))
     body: Mapped[str] = mapped_column(Text, default="")
     aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -225,6 +256,38 @@ class AnalysisProposal(Base):
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ChronicleEntry(Base):
+    """Editable session-facing presentation of an approved analysis finding."""
+
+    __tablename__ = "chronicle_entries"
+    __table_args__ = (
+        UniqueConstraint("session_id", "source_proposal_id", name="uq_chronicle_source_proposal"),
+        Index("ix_chronicle_entries_session_section", "session_id", "section", "position"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), index=True
+    )
+    source_proposal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("analysis_proposals.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    section: Mapped[str] = mapped_column(String(30))
+    entry_type: Mapped[str] = mapped_column(String(40))
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text, default="")
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    visibility: Mapped[str] = mapped_column(String(20), default="gm")
+    entry_metadata: Mapped[dict[str, object]] = mapped_column("metadata", JSON, default=dict)
+    created_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
 
 
 class GameSession(Base):
@@ -335,9 +398,39 @@ class Job(Base):
     status: Mapped[str] = mapped_column(String(30), default=JobStatus.QUEUED.value)
     payload: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     priority: Mapped[int] = mapped_column(Integer, default=0)
+    queue_position: Mapped[int] = mapped_column(Integer, default=0)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class ComputeWorker(Base):
+    """An administrator-managed endpoint capable of running processing jobs."""
+
+    __tablename__ = "compute_workers"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    provider: Mapped[str] = mapped_column(String(40), default="ollama")
+    base_url: Mapped[str] = mapped_column(String(500))
+    capabilities: Mapped[list[str]] = mapped_column(JSON, default=list)
+    analysis_model: Mapped[str] = mapped_column(String(160), default="")
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    concurrency: Mapped[int] = mapped_column(Integer, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_status: Mapped[str] = mapped_column(String(30), default="unknown")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    available_models: Mapped[list[str]] = mapped_column(JSON, default=list)
+    last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_by_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now

@@ -10,6 +10,8 @@ from campaign_manager.analysis import (
     ExtractedProposal,
     build_analysis_prompt,
     build_analysis_prompts,
+    canonicalize_character_kinds,
+    consolidate_analysis,
     merge_chunk_proposals,
     ollama_status,
     process_analysis_job,
@@ -269,6 +271,173 @@ def test_analysis_accepts_singular_string_ids_and_caps_evidence_entries() -> Non
     assert len(proposal.evidence) == 20
     assert [item.segment_ids for item in proposal.evidence[:2]] == [[0], [1]]
     assert [item.segment_ids for item in proposal.evidence[-2:]] == [[76], [77]]
+
+
+def test_analysis_normalizes_structured_aliases_from_model_output() -> None:
+    proposal = ExtractedProposal.model_validate({
+        "kind": "player_character", "title": "Caelen", "body": "A local hero.",
+        "aliases": [
+            {"name": "Cailin", "description": "phonetic spelling"},
+            {"alias": "Kalen"},
+            " Caelen Meir Harpell ",
+            {"description": "missing a usable alias"},
+        ],
+        "confidence": 0.9, "visibility": "gm", "evidence": [],
+    })
+
+    assert proposal.aliases == ["Cailin", "Kalen", "Caelen Meir Harpell"]
+
+
+def test_analysis_normalizes_compact_evidence_and_misplaced_visibility() -> None:
+    proposal = ExtractedProposal.model_validate({
+        "kind": "npc", "title": "Mayor Nez", "body": "Mayor of Dinah.",
+        "lane": "gm", "aliases": [], "confidence": 0.9,
+        "evidence": ["[84 502.0-510.0s] Tim: The mayor approaches."],
+    })
+
+    assert proposal.lane == "story"
+    assert proposal.visibility == "gm"
+    assert proposal.evidence[0].segment_ids == [84]
+    assert proposal.evidence[0].quote == "Tim: The mayor approaches."
+
+    follow_up = ExtractedProposal.model_validate({
+        "kind": "meta", "title": "Check heroic inspiration later", "body": "Rules research.",
+        "aliases": [], "confidence": 0.8, "visibility": "gm", "evidence": [],
+    })
+    assert follow_up.kind == "follow_up"
+    assert follow_up.lane == "meta"
+
+    compact_ids = ExtractedProposal.model_validate({
+        "kind": "scene", "title": "Rabbit chase", "body": "The party gives chase.",
+        "aliases": [], "confidence": 0.9, "visibility": "player",
+        "evidence": [934, "935", 936],
+    })
+    assert compact_ids.evidence[0].segment_ids == [934, 935, 936]
+
+
+def test_consolidation_separates_story_from_meta_and_merges_entities() -> None:
+    session = GameSession(
+        title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4()
+    )
+    candidates = [ExtractedProposal.model_validate({
+        "kind": "player_character", "title": title, "body": body,
+        "aliases": [], "confidence": 0.9, "visibility": "player",
+        "evidence": [{"segment_ids": [segment], "quote": body}],
+    }) for title, body, segment in [
+        ("Magnus Heartsbane", "Magnus is a purple tiefling bard.", 1),
+        ("Magnus's performance", "Magnus seeks fame through performance.", 2),
+    ]]
+    candidates.append(ExtractedProposal.model_validate({
+        "kind": "follow_up", "title": "Check inspiration rule", "body": "GM will check later.",
+        "aliases": [], "confidence": 0.8, "visibility": "gm",
+        "evidence": [{"segment_ids": [3], "quote": "I'll check later."}],
+    }))
+    captured = []
+
+    def fake_analyze(prompt, model, schema):
+        captured.append(prompt)
+        if "narrative section" in prompt:
+            proposals = [{
+                "kind": "session_summary", "title": "Session recap", "body": "Magnus performed.",
+                "aliases": [], "confidence": 0.9, "visibility": "player",
+                "evidence": [{"segment_ids": [1, 2], "quote": "Magnus performed."}],
+            }]
+        elif "entities section" in prompt:
+            proposals = [{
+                "kind": "player_character", "title": "Magnus Heartsbane",
+                "body": "A purple tiefling bard who seeks fame through performance.",
+                "aliases": [], "confidence": 0.9, "visibility": "player",
+                "evidence": [{"segment_ids": [1, 2], "quote": "purple tiefling bard"}],
+            }]
+        else:
+            proposals = [{
+                "kind": "follow_up", "title": "Check inspiration rule",
+                "body": "Confirm the inspiration rule after the session.", "aliases": [],
+                "confidence": 0.8, "visibility": "gm",
+                "evidence": [{"segment_ids": [3], "quote": "I'll check later."}],
+            }]
+        return AnalysisResult.model_validate({"proposals": proposals}), {"eval_count": 30}
+
+    result, metadata = consolidate_analysis(
+        session, [], [], candidates, fake_analyze, "test-model", 20_000
+    )
+
+    assert [proposal.title for proposal in result.proposals].count("Magnus Heartsbane") == 1
+    assert next(p for p in result.proposals if p.kind == "follow_up").lane == "meta"
+    assert next(p for p in result.proposals if p.kind == "session_summary").lane == "story"
+    # Narrative, its coverage retry, entities, then meta; threads has no candidates.
+    assert len(captured) == 4
+    assert sum("COVERAGE REQUIREMENT" in prompt for prompt in captured) == 1
+    assert all("Speakers are not automatically their PCs" in prompt for prompt in captured)
+    assert {item["section"] for item in metadata} == {"narrative", "entities", "meta"}
+
+
+def test_narrative_coverage_retry_replaces_the_narrow_recap() -> None:
+    session = GameSession(
+        title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4()
+    )
+    candidates = [ExtractedProposal.model_validate({
+        "kind": "scene", "title": f"Scene {segment}", "body": f"Something happens at {segment}.",
+        "aliases": [], "confidence": 0.9, "visibility": "player",
+        "evidence": [{"segment_ids": [segment], "quote": f"line {segment}"}],
+    }) for segment in (1, 20, 40, 60, 80)]
+    narrow = "The party met in the tavern. " * 20
+    full = "The party met, travelled, fought, and returned changed. " * 40
+
+    def fake_analyze(prompt, model, schema):
+        body = full if "COVERAGE REQUIREMENT" in prompt else narrow
+        return AnalysisResult.model_validate({"proposals": [{
+            "kind": "session_summary", "title": "Session recap", "body": body,
+            "aliases": [], "confidence": 0.9, "visibility": "player",
+            "evidence": [{"segment_ids": [1, 40, 80], "quote": "line 1"}],
+        }]}), {"eval_count": 30}
+
+    result, metadata = consolidate_analysis(
+        session, [], [], candidates, fake_analyze, "test-model", 20_000
+    )
+
+    summaries = [proposal for proposal in result.proposals if proposal.kind == "session_summary"]
+    assert len(summaries) == 1
+    assert full.strip() in summaries[0].body
+    assert narrow.strip() not in summaries[0].body
+    assert "coverage_retry" in next(
+        item for item in metadata if item["section"] == "narrative"
+    )
+
+
+def test_character_classification_uses_campaign_guide_and_removes_annotations() -> None:
+    creator_id = uuid.uuid4()
+    campaign_id = uuid.uuid4()
+    magnus = CampaignGuideEntry(
+        id=uuid.uuid4(),
+        campaign_id=campaign_id, kind="character", canonical_name="Magnus Heartsbane",
+        aliases=["Magnus Hartspain"], notes="Player character", visibility="player",
+        created_by_id=creator_id,
+    )
+    mayor = CampaignGuideEntry(
+        id=uuid.uuid4(),
+        campaign_id=campaign_id, kind="npc", canonical_name="Mayor Bartholomew Nez",
+        aliases=["Mayor Nez"], notes="Mayor of Dinah", visibility="gm",
+        created_by_id=creator_id,
+    )
+    proposals = [ExtractedProposal.model_validate({
+        "kind": "character", "title": "Magnus Heartsbane (Michael)", "body": "A bard.",
+        "aliases": [], "confidence": 0.9, "visibility": "player", "evidence": [],
+    }), ExtractedProposal.model_validate({
+        "kind": "character", "title": "Mayor Nez (Schlock)", "body": "The mayor.",
+        "aliases": [], "confidence": 0.9, "visibility": "gm", "evidence": [],
+    }), ExtractedProposal.model_validate({
+        "kind": "character", "title": "Unknown Teenager (Prankster)", "body": "A stranger.",
+        "aliases": [], "confidence": 0.8, "visibility": "gm", "evidence": [],
+    })]
+
+    result = canonicalize_character_kinds(proposals, [magnus, mayor], {magnus.id})
+
+    assert [(proposal.kind, proposal.title) for proposal in result] == [
+        ("player_character", "Magnus Heartsbane"),
+        ("npc", "Mayor Bartholomew Nez"),
+        ("npc", "Unknown Teenager"),
+    ]
 
 
 def test_prompt_includes_resolved_speaker_attribution(tmp_path) -> None:

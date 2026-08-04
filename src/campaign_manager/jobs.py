@@ -46,7 +46,7 @@ def claim_next_job(database: Session, supported_kinds: Collection[str]) -> Job |
             Job.cancel_requested.is_(False),
             Job.kind.in_(claimable_kinds),
         )
-        .order_by(Job.priority.desc(), Job.created_at, Job.id)
+        .order_by(Job.priority.desc(), Job.queue_position, Job.created_at, Job.id)
         .with_for_update(skip_locked=True)
         .limit(1)
     )

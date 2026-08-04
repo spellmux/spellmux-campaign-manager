@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -99,6 +100,35 @@ class SessionResponse(BaseModel):
     created_at: datetime
 
 
+class ChronicleEntryUpdate(BaseModel):
+    section: str = Field(min_length=1, max_length=30)
+    entry_type: str = Field(min_length=1, max_length=40)
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(default="", max_length=100_000)
+    position: int = Field(default=0, ge=0, le=10000)
+    visibility: str = "gm"
+
+    @field_validator("visibility")
+    @classmethod
+    def valid_chronicle_visibility(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"gm", "player"}:
+            raise ValueError("Visibility must be gm or player")
+        return normalized
+
+
+class ChronicleEntryResponse(ChronicleEntryUpdate):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    session_id: uuid.UUID
+    source_proposal_id: uuid.UUID | None
+    metadata: dict[str, object] = Field(validation_alias="entry_metadata", serialization_alias="metadata")
+    created_by_id: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+
+
 class JobResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -106,6 +136,7 @@ class JobResponse(BaseModel):
     kind: str
     status: str
     priority: int
+    queue_position: int
     cancel_requested: bool
     attempts: int
     error: str | None
@@ -125,6 +156,18 @@ class JobPriorityUpdate(BaseModel):
     priority: int = Field(ge=-100, le=100)
 
 
+class QueueMoveRequest(BaseModel):
+    direction: str
+
+    @field_validator("direction")
+    @classmethod
+    def valid_direction(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"up", "down"}:
+            raise ValueError("Direction must be up or down")
+        return normalized
+
+
 class ProcessingControlUpdate(BaseModel):
     paused: bool
 
@@ -135,6 +178,76 @@ class ProcessingControlResponse(BaseModel):
     kind: str
     paused: bool
     updated_at: datetime
+
+
+class ComputeWorkerCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    provider: str = "ollama"
+    base_url: str = Field(min_length=8, max_length=500)
+    capabilities: list[str] = Field(default_factory=lambda: ["analysis"], max_length=10)
+    analysis_model: str = Field(min_length=1, max_length=160)
+    priority: int = Field(default=0, ge=-100, le=100)
+    concurrency: int = Field(default=1, ge=1, le=32)
+    enabled: bool = True
+
+    @field_validator("provider")
+    @classmethod
+    def valid_provider(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized != "ollama":
+            raise ValueError("The first compute-worker release supports Ollama endpoints")
+        return normalized
+
+    @field_validator("base_url")
+    @classmethod
+    def valid_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("Base URL must be an HTTP or HTTPS endpoint")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("Base URL cannot contain credentials, query parameters, or fragments")
+        return normalized
+
+    @field_validator("capabilities")
+    @classmethod
+    def valid_capabilities(cls, value: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(item.strip().casefold() for item in value))
+        supported = {"analysis", "transcription", "diarization", "image_generation"}
+        if not normalized or any(item not in supported for item in normalized):
+            raise ValueError("Choose at least one supported compute capability")
+        return normalized
+
+
+class ComputeWorkerUpdate(ComputeWorkerCreate):
+    pass
+
+
+class ComputeWorkerResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    provider: str
+    base_url: str
+    capabilities: list[str]
+    analysis_model: str
+    priority: int
+    concurrency: int
+    enabled: bool
+    last_status: str
+    last_error: str | None
+    available_models: list[str]
+    last_checked_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ComputeWorkerTestResponse(BaseModel):
+    worker: ComputeWorkerResponse
+    ready: bool
+    models: list[str]
+    detail: str | None
 
 
 class ArtifactResponse(BaseModel):
@@ -246,9 +359,36 @@ class CampaignGuideResponse(BaseModel):
     updated_at: datetime
 
 
+class CampaignGuideFactCreate(BaseModel):
+    category: str = Field(default="session_detail", min_length=1, max_length=40)
+    value: str = Field(min_length=1, max_length=50_000)
+    status: str = "canonical"
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    visibility: str = "gm"
+    session_id: uuid.UUID | None = None
+
+
+class CampaignGuideFactResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    guide_entry_id: uuid.UUID
+    session_id: uuid.UUID | None
+    source_proposal_id: uuid.UUID | None
+    category: str
+    value: str
+    status: str
+    confidence: float | None
+    visibility: str
+    created_by_id: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+
+
 ANALYSIS_KINDS = {
     "session_summary", "character", "player_character", "npc", "monster", "location", "item", "spell", "creature",
     "quest", "faction", "deity", "rule", "important_decision", "unresolved_question",
+    "scene", "memorable_moment", "follow_up", "table_note",
 }
 
 
@@ -261,6 +401,7 @@ class ProposalEvidence(BaseModel):
 
 class AnalysisProposalCreate(BaseModel):
     kind: str
+    lane: str = "story"
     title: str = Field(min_length=1, max_length=200)
     body: str = Field(default="", max_length=50_000)
     aliases: list[str] = Field(default_factory=list, max_length=50)
@@ -287,6 +428,14 @@ class AnalysisProposalCreate(BaseModel):
             raise ValueError("Visibility must be gm or player")
         return normalized
 
+    @field_validator("lane")
+    @classmethod
+    def valid_analysis_lane(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"story", "meta"}:
+            raise ValueError("Lane must be story or meta")
+        return normalized
+
     @field_validator("aliases")
     @classmethod
     def clean_analysis_aliases(cls, value: list[str]) -> list[str]:
@@ -298,6 +447,7 @@ class AnalysisProposalUpdate(BaseModel):
     body: str = Field(default="", max_length=50_000)
     aliases: list[str] = Field(default_factory=list, max_length=50)
     visibility: str = "gm"
+    lane: str = "story"
 
     @field_validator("visibility")
     @classmethod
@@ -307,6 +457,14 @@ class AnalysisProposalUpdate(BaseModel):
             raise ValueError("Visibility must be gm or player")
         return normalized
 
+    @field_validator("lane")
+    @classmethod
+    def valid_lane(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized not in {"story", "meta"}:
+            raise ValueError("Lane must be story or meta")
+        return normalized
+
 
 class AnalysisProposalResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -314,6 +472,7 @@ class AnalysisProposalResponse(BaseModel):
     id: uuid.UUID
     session_id: uuid.UUID
     kind: str
+    lane: str
     title: str
     body: str
     aliases: list[str]

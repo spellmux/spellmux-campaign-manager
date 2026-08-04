@@ -14,15 +14,15 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, st
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select, text
+from sqlalchemy import case, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from campaign_manager import __version__
-from campaign_manager.analysis import ollama_status
 from campaign_manager.artifacts import ingest_audio, ingest_text
 from campaign_manager.auth import authenticate, current_user, issue_token, revoke_token
 from campaign_manager.comparison import compare_transcripts
+from campaign_manager.compute import effective_analysis_status, probe_ollama
 from campaign_manager.config import Settings
 from campaign_manager.database import database_session
 from campaign_manager.diarization import attribute_transcript_segments, cluster_resolutions
@@ -31,8 +31,11 @@ from campaign_manager.models import (
     Artifact,
     Campaign,
     CampaignGuideEntry,
+    CampaignGuideFact,
     CampaignMembership,
     CampaignRole,
+    ChronicleEntry,
+    ComputeWorker,
     GameSession,
     Job,
     ProcessingControl,
@@ -62,10 +65,18 @@ from campaign_manager.schemas import (
     ArtifactResponse,
     CampaignCreate,
     CampaignGuideCreate,
+    CampaignGuideFactCreate,
+    CampaignGuideFactResponse,
     CampaignGuideResponse,
     CampaignGuideUpdate,
     CampaignResponse,
     CampaignUpdate,
+    ChronicleEntryResponse,
+    ChronicleEntryUpdate,
+    ComputeWorkerCreate,
+    ComputeWorkerResponse,
+    ComputeWorkerTestResponse,
+    ComputeWorkerUpdate,
     JobPriorityUpdate,
     JobResponse,
     LoginRequest,
@@ -76,6 +87,7 @@ from campaign_manager.schemas import (
     PublicationResponse,
     PublicationUpdate,
     QueueJobResponse,
+    QueueMoveRequest,
     SessionCreate,
     SessionResponse,
     SessionUpdate,
@@ -180,9 +192,126 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return user
 
     @app.get("/api/v1/analysis/status", tags=["analysis-review"])
-    def analysis_status(user: User = Depends(current_user)) -> dict[str, object]:
+    def analysis_status(
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> dict[str, object]:
         del user
-        return ollama_status(resolved)
+        return effective_analysis_status(database, resolved)
+
+    def require_instance_admin(user: User) -> None:
+        if not user.is_instance_admin:
+            raise HTTPException(status_code=403, detail="Instance administrator required")
+
+    @app.get(
+        "/api/v1/compute-workers",
+        response_model=list[ComputeWorkerResponse],
+        tags=["compute-workers"],
+    )
+    def list_compute_workers(
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[ComputeWorker]:
+        require_instance_admin(user)
+        return list(database.scalars(
+            select(ComputeWorker).order_by(ComputeWorker.priority.desc(), ComputeWorker.name)
+        ))
+
+    @app.post(
+        "/api/v1/compute-workers",
+        response_model=ComputeWorkerResponse,
+        status_code=201,
+        tags=["compute-workers"],
+    )
+    def create_compute_worker(
+        request: ComputeWorkerCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> ComputeWorker:
+        require_instance_admin(user)
+        worker = ComputeWorker(**request.model_dump(), created_by_id=user.id)
+        database.add(worker)
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="Compute worker name already exists") from exc
+        database.refresh(worker)
+        return worker
+
+    def managed_compute_worker(
+        database: Session, user: User, worker_id: uuid.UUID
+    ) -> ComputeWorker:
+        require_instance_admin(user)
+        worker = database.get(ComputeWorker, worker_id)
+        if worker is None:
+            raise HTTPException(status_code=404, detail="Compute worker not found")
+        return worker
+
+    @app.put(
+        "/api/v1/compute-workers/{worker_id}",
+        response_model=ComputeWorkerResponse,
+        tags=["compute-workers"],
+    )
+    def update_compute_worker(
+        worker_id: uuid.UUID,
+        request: ComputeWorkerUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> ComputeWorker:
+        worker = managed_compute_worker(database, user, worker_id)
+        for field, value in request.model_dump().items():
+            setattr(worker, field, value)
+        worker.last_status = "unknown"
+        worker.last_error = None
+        worker.available_models = []
+        worker.last_checked_at = None
+        worker.updated_at = datetime.now(UTC)
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="Compute worker name already exists") from exc
+        database.refresh(worker)
+        return worker
+
+    @app.delete(
+        "/api/v1/compute-workers/{worker_id}",
+        status_code=204,
+        tags=["compute-workers"],
+    )
+    def delete_compute_worker(
+        worker_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> None:
+        worker = managed_compute_worker(database, user, worker_id)
+        database.delete(worker)
+        database.commit()
+
+    @app.post(
+        "/api/v1/compute-workers/{worker_id}/test",
+        response_model=ComputeWorkerTestResponse,
+        tags=["compute-workers"],
+    )
+    def test_compute_worker(
+        worker_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> ComputeWorkerTestResponse:
+        worker = managed_compute_worker(database, user, worker_id)
+        result = probe_ollama(worker.base_url, worker.analysis_model, timeout=10)
+        worker.last_status = "ready" if result["ready"] else "unavailable"
+        worker.last_error = result.get("detail")
+        worker.available_models = result["models"]
+        worker.last_checked_at = datetime.now(UTC)
+        worker.updated_at = datetime.now(UTC)
+        database.commit()
+        database.refresh(worker)
+        return ComputeWorkerTestResponse(
+            worker=ComputeWorkerResponse.model_validate(worker),
+            ready=result["ready"], models=result["models"], detail=result.get("detail"),
+        )
 
     @app.get("/api/v1/campaigns", response_model=list[CampaignResponse], tags=["campaigns"])
     def list_campaigns(
@@ -372,6 +501,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Campaign Guide entry not found")
         database.delete(entry)
         database.commit()
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/guide/{entry_id}/facts",
+        response_model=list[CampaignGuideFactResponse],
+        tags=["campaign-guide"],
+    )
+    def list_campaign_guide_facts(
+        campaign_id: uuid.UUID, entry_id: uuid.UUID,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> list[CampaignGuideFact]:
+        membership = require_campaign_role(database, user, campaign_id)
+        entry = database.scalar(select(CampaignGuideEntry).where(
+            CampaignGuideEntry.id == entry_id, CampaignGuideEntry.campaign_id == campaign_id,
+            CampaignGuideEntry.is_active.is_(True),
+        ))
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Campaign Guide entry not found")
+        statement = select(CampaignGuideFact).where(CampaignGuideFact.guide_entry_id == entry_id)
+        if membership.role == CampaignRole.PLAYER.value:
+            statement = statement.where(CampaignGuideFact.visibility == "player", CampaignGuideFact.status == "canonical")
+        return list(database.scalars(statement.order_by(CampaignGuideFact.created_at)))
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/guide/{entry_id}/facts",
+        response_model=CampaignGuideFactResponse,
+        status_code=201,
+        tags=["campaign-guide"],
+    )
+    def create_campaign_guide_fact(
+        campaign_id: uuid.UUID, entry_id: uuid.UUID, request: CampaignGuideFactCreate,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> CampaignGuideFact:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        entry = database.scalar(select(CampaignGuideEntry).where(
+            CampaignGuideEntry.id == entry_id, CampaignGuideEntry.campaign_id == campaign_id,
+        ))
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Campaign Guide entry not found")
+        if request.session_id is not None and database.scalar(select(GameSession.id).where(
+            GameSession.id == request.session_id, GameSession.campaign_id == campaign_id,
+        )) is None:
+            raise HTTPException(status_code=422, detail="Fact session must belong to this campaign")
+        fact = CampaignGuideFact(
+            guide_entry_id=entry_id, session_id=request.session_id, category=request.category.strip().casefold(),
+            value=request.value.strip(), status=request.status.strip().casefold(), confidence=request.confidence,
+            visibility=request.visibility, created_by_id=user.id,
+        )
+        database.add(fact)
+        database.commit()
+        database.refresh(fact)
+        return fact
 
     @app.get(
         "/api/v1/campaigns/{campaign_id}/speakers",
@@ -757,6 +937,78 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Analysis proposal not found")
         return proposal
 
+    def chronicle_entry(
+        database: Session, campaign_id: uuid.UUID, session_id: uuid.UUID, entry_id: uuid.UUID
+    ) -> ChronicleEntry:
+        entry = database.scalar(
+            select(ChronicleEntry)
+            .join(GameSession, GameSession.id == ChronicleEntry.session_id)
+            .where(
+                ChronicleEntry.id == entry_id,
+                ChronicleEntry.session_id == session_id,
+                GameSession.campaign_id == campaign_id,
+            )
+        )
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Chronicle entry not found")
+        return entry
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/chronicle",
+        response_model=list[ChronicleEntryResponse],
+        tags=["chronicle"],
+    )
+    def list_chronicle_entries(
+        campaign_id: uuid.UUID, session_id: uuid.UUID,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> list[ChronicleEntry]:
+        membership = require_campaign_role(database, user, campaign_id, {"owner", "gm", "player"})
+        if database.scalar(select(GameSession.id).where(
+            GameSession.id == session_id, GameSession.campaign_id == campaign_id
+        )) is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        statement = select(ChronicleEntry).where(ChronicleEntry.session_id == session_id)
+        if membership.role not in {"owner", "gm"}:
+            statement = statement.where(ChronicleEntry.visibility == "player")
+        return list(database.scalars(statement.order_by(ChronicleEntry.section, ChronicleEntry.position, ChronicleEntry.created_at)))
+
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/chronicle/{entry_id}",
+        response_model=ChronicleEntryResponse,
+        tags=["chronicle"],
+    )
+    def update_chronicle_entry(
+        campaign_id: uuid.UUID, session_id: uuid.UUID, entry_id: uuid.UUID,
+        request: ChronicleEntryUpdate, user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> ChronicleEntry:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        entry = chronicle_entry(database, campaign_id, session_id, entry_id)
+        entry.section = request.section.strip().casefold()
+        entry.entry_type = request.entry_type.strip().casefold()
+        entry.title = request.title.strip()
+        entry.body = request.body.strip()
+        entry.position = request.position
+        entry.visibility = request.visibility
+        database.commit()
+        database.refresh(entry)
+        return entry
+
+    @app.delete(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/chronicle/{entry_id}",
+        status_code=204,
+        tags=["chronicle"],
+    )
+    def delete_chronicle_entry(
+        campaign_id: uuid.UUID, session_id: uuid.UUID, entry_id: uuid.UUID,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> Response:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        entry = chronicle_entry(database, campaign_id, session_id, entry_id)
+        database.delete(entry)
+        database.commit()
+        return Response(status_code=204)
+
     @app.get(
         "/api/v1/campaigns/{campaign_id}/analysis-proposals",
         response_model=list[AnalysisProposalResponse],
@@ -832,7 +1084,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if valid_ids != artifact_ids:
                 raise HTTPException(status_code=422, detail="Evidence must reference this session's artifacts")
         proposal = AnalysisProposal(
-            session_id=session_id, kind=request.kind, title=request.title.strip(),
+            session_id=session_id, kind=request.kind, lane=request.lane, title=request.title.strip(),
             body=request.body.strip(), aliases=request.aliases,
             evidence=[item.model_dump(mode="json") for item in request.evidence],
             confidence=request.confidence, visibility=request.visibility,
@@ -862,6 +1114,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         proposal.body = request.body.strip()
         proposal.aliases = list(dict.fromkeys(a.strip() for a in request.aliases if a.strip()))
         proposal.visibility = request.visibility
+        proposal.lane = request.lane
         database.commit()
         database.refresh(proposal)
         return proposal
@@ -895,6 +1148,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 database.add(entry)
                 database.flush()
             proposal.promoted_guide_entry_id = entry.id
+            if proposal.body.strip() and database.scalar(select(CampaignGuideFact.id).where(
+                CampaignGuideFact.source_proposal_id == proposal.id
+            )) is None:
+                database.add(CampaignGuideFact(
+                    guide_entry_id=entry.id,
+                    session_id=session_id,
+                    source_proposal_id=proposal.id,
+                    category="session_detail",
+                    value=proposal.body.strip(),
+                    status="canonical",
+                    confidence=proposal.confidence,
+                    visibility=proposal.visibility,
+                    created_by_id=user.id,
+                ))
+        chronicle_sections = {
+            "session_summary": ("recap", "recap"),
+            "scene": ("outline", "scene"),
+            "memorable_moment": ("moments", "memorable_moment"),
+            "character": ("entities", "character"),
+            "player_character": ("entities", "player_character"),
+            "npc": ("entities", "npc"),
+            "monster": ("entities", "monster"),
+            "creature": ("entities", "creature"),
+            "location": ("entities", "location"),
+            "item": ("entities", "item"),
+            "spell": ("entities", "spell"),
+            "faction": ("entities", "faction"),
+            "deity": ("entities", "deity"),
+            "important_decision": ("threads", "decision"),
+            "quest": ("threads", "quest"),
+            "unresolved_question": ("threads", "unresolved_question"),
+            "follow_up": ("meta", "follow_up"),
+            "rule": ("meta", "rule"),
+            "table_note": ("meta", "table_note"),
+        }
+        section_type = chronicle_sections.get(proposal.kind)
+        if section_type:
+            section, entry_type = section_type
+            existing = database.scalar(select(ChronicleEntry).where(
+                ChronicleEntry.source_proposal_id == proposal.id
+            ))
+            if existing is None:
+                position = database.scalar(select(func.count(ChronicleEntry.id)).where(
+                    ChronicleEntry.session_id == session_id, ChronicleEntry.section == section
+                )) or 0
+                database.add(ChronicleEntry(
+                    session_id=session_id, source_proposal_id=proposal.id,
+                    section=section, entry_type=entry_type, title=proposal.title,
+                    body=proposal.body, position=position, visibility=proposal.visibility,
+                    entry_metadata={"aliases": proposal.aliases, "evidence": proposal.evidence},
+                    created_by_id=user.id,
+                ))
         proposal.status = "approved"
         proposal.reviewed_by_id = user.id
         proposal.reviewed_at = datetime.now(UTC)
@@ -1194,7 +1499,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             select(Job, GameSession, Campaign)
             .outerjoin(GameSession, GameSession.id == Job.session_id)
             .outerjoin(Campaign, Campaign.id == GameSession.campaign_id)
-            .order_by(Job.status, Job.priority.desc(), Job.created_at)
+            .order_by(
+                case((Job.status == "running", 0), (Job.status == "queued", 1), else_=2),
+                Job.priority.desc(), Job.queue_position, Job.created_at,
+            )
             .limit(500)
         )
         if not user.is_instance_admin:
@@ -1207,6 +1515,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         rows = database.execute(statement).all()
         return [QueueJobResponse(
             id=job.id, kind=job.kind, status=job.status, priority=job.priority,
+            queue_position=job.queue_position,
             cancel_requested=job.cancel_requested, attempts=job.attempts, error=job.error,
             payload=job.payload,
             created_at=job.created_at, updated_at=job.updated_at,
@@ -1234,6 +1543,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         job.updated_at = datetime.now(UTC)
         database.commit()
         database.refresh(job)
+        return job
+
+    @app.post(
+        "/api/v1/jobs/{job_id}/move",
+        response_model=JobResponse,
+        tags=["processing"],
+    )
+    def move_queued_job(
+        job_id: uuid.UUID,
+        request: QueueMoveRequest,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Job:
+        job, _ = manageable_job(database, user, job_id)
+        if job.status != "queued":
+            raise HTTPException(status_code=409, detail="Only queued jobs can be reordered")
+        ordered = list(database.scalars(select(Job).where(
+            Job.status == "queued",
+        ).order_by(Job.priority.desc(), Job.queue_position, Job.created_at, Job.id)))
+        try:
+            current_index = next(index for index, item in enumerate(ordered) if item.id == job.id)
+        except StopIteration as exc:
+            raise HTTPException(status_code=404, detail="Queued job not found") from exc
+        target_index = current_index - 1 if request.direction == "up" else current_index + 1
+        if 0 <= target_index < len(ordered):
+            neighbor = ordered[target_index]
+            job.priority = neighbor.priority
+            ordered.pop(current_index)
+            ordered.insert(target_index, job)
+            now = datetime.now(UTC)
+            for position, item in enumerate(ordered):
+                item.queue_position = position
+                item.updated_at = now
+            database.commit()
+            database.refresh(job)
         return job
 
     @app.post(
@@ -1382,6 +1726,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             source = min(sources, key=lambda item: priority[item.kind], default=None)
         if source is None:
             raise HTTPException(status_code=409, detail="Add a transcript or notes before analysis")
+        diarization_active = database.scalar(select(Job.id).where(
+            Job.session_id == session_id,
+            Job.kind == "diarization",
+            Job.status.in_({"queued", "running"}),
+        ))
+        if diarization_active is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Diarization is still queued or running; analysis can start after it completes",
+            )
         active = database.scalar(select(Job.id).where(
             Job.session_id == session_id,
             Job.kind == "analysis",
