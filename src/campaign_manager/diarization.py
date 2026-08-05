@@ -316,6 +316,31 @@ def _load_pcm_wav(path: Path) -> dict[str, Any]:
     return {"waveform": waveform, "sample_rate": sample_rate}
 
 
+def load_pcm_wav_window(path: Path, start_seconds: float, end_seconds: float) -> dict[str, Any]:
+    """Load one time range of a normalized PCM WAV as a pyannote waveform dict.
+
+    Reads only the requested frames, so embedding a short reference clip does not
+    load a multi-hour recording into memory, and passes a waveform rather than a
+    path because TorchCodec decoding is not available in the worker image.
+    """
+    import torch
+
+    with wave.open(str(path), "rb") as source:
+        if source.getnchannels() != 1 or source.getsampwidth() != 2:
+            raise ValueError("Speaker embedding requires mono 16-bit PCM normalized audio")
+        sample_rate = source.getframerate()
+        total_frames = source.getnframes()
+        first = max(0, min(int(start_seconds * sample_rate), total_frames))
+        last = max(first, min(int(end_seconds * sample_rate), total_frames))
+        if last <= first:
+            raise ValueError("Requested audio window is empty")
+        source.setpos(first)
+        frames = source.readframes(last - first)
+    waveform = torch.frombuffer(bytearray(frames), dtype=torch.int16).to(torch.float32)
+    waveform = (waveform / 32768.0).unsqueeze(0)
+    return {"waveform": waveform, "sample_rate": sample_rate}
+
+
 @lru_cache(maxsize=1)
 def _cached_pipeline(model: str, device: str, token: str | None, model_root: str) -> Any:
     os.environ.setdefault("HF_HOME", model_root)

@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from campaign_manager.config import Settings
+from campaign_manager.diarization import load_pcm_wav_window
 from campaign_manager.models import (
     Artifact,
     GameSession,
@@ -216,13 +217,16 @@ def pyannote_embedder(settings: Settings) -> tuple[Embed, str]:
 
     def embed(path: Path, start: float, end: float) -> list[float]:
         from pyannote.audio import Inference
-        from pyannote.core import Segment
 
-        model = _cached_embedding_model(model_name, settings.huggingface_token, str(settings.model_root))
+        model = _cached_embedding_model(
+            model_name, settings.huggingface_token, str(settings.model_root)
+        )
         inference = Inference(model, window="whole")
         if settings.diarization_device and settings.diarization_device != "cpu":
             inference.to(_torch_device(settings.diarization_device))
-        vector = inference.crop(str(path), Segment(start, end))
+        # The loaded window is already the clip, so it is embedded whole. Passing
+        # a path would require TorchCodec, which the worker image cannot load.
+        vector = inference(load_pcm_wav_window(path, start, end))
         return [float(value) for value in vector.reshape(-1)]
 
     return embed, model_name

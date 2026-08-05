@@ -11,6 +11,7 @@ from campaign_manager.diarization import (
     as_diarization_result,
     attribute_transcript_segments,
     cluster_resolutions,
+    load_pcm_wav_window,
     representative_clips,
 )
 
@@ -142,3 +143,31 @@ def test_diarization_accepts_adapters_that_return_only_turns() -> None:
         embedding_model="pyannote/speaker-diarization-community-1",
     )
     assert as_diarization_result(enriched) is enriched
+
+
+def test_wav_window_reads_only_the_requested_clip(tmp_path) -> None:
+    pytest.importorskip("torch")
+    import struct
+
+    path = tmp_path / "normalized.wav"
+    sample_rate = 16_000
+    with wave.open(str(path), "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(sample_rate)
+        # Three seconds: 0s silence, 1s loud, 2s silence.
+        frames = [0] * sample_rate + [12_000] * sample_rate + [0] * sample_rate
+        target.writeframes(struct.pack(f"<{len(frames)}h", *frames))
+
+    window = load_pcm_wav_window(path, 1.0, 2.0)
+
+    assert window["sample_rate"] == sample_rate
+    assert window["waveform"].shape == (1, sample_rate)
+    # Only the loud second was read, not the whole file.
+    assert float(window["waveform"].abs().mean()) > 0.3
+
+    clamped = load_pcm_wav_window(path, 2.5, 99.0)
+    assert clamped["waveform"].shape[1] == sample_rate // 2
+
+    with pytest.raises(ValueError, match="empty"):
+        load_pcm_wav_window(path, 3.0, 3.0)
