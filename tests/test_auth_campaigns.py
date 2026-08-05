@@ -11,7 +11,6 @@ from campaign_manager.config import Settings
 from campaign_manager.database import configure_database, session_factory
 from campaign_manager.models import Artifact, Base, GameSession, Job, ProcessingControl, User
 
-
 TEST_PASSWORD = "correct horse battery staple"
 
 

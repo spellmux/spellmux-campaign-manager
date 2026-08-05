@@ -1414,6 +1414,9 @@ def ollama_analyzer(settings: Settings) -> Analyze:
             # $defs/$ref form that Pydantic generates.
             "format": schema,
             "think": False,
+            # Release VRAM promptly so a transcription or image job does not
+            # wait behind an idle model on a single-GPU worker.
+            "keep_alive": f"{settings.analysis_keep_alive_seconds}s",
             "options": {
                 "temperature": 0,
                 "num_ctx": settings.analysis_context_tokens,

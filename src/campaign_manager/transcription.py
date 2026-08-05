@@ -24,7 +24,34 @@ from campaign_manager.models import (
     SessionStatus,
 )
 
-Transcribe = Callable[[Path, str], dict[str, Any]]
+# hotwords is optional so an adapter that ignores it keeps working.
+Transcribe = Callable[..., dict[str, Any]]
+
+
+def build_hotwords(entries: Iterable[CampaignGuideEntry], limit: int = 800) -> str:
+    """Build a bounded proper-noun bias applied across the whole recording.
+
+    initial_prompt only conditions the opening window and then drifts, which is
+    why canonical names still came back misheard late in a session: one character
+    accumulated six phonetic spellings in the guide, and an inn was transcribed
+    with the wrong name. Hotwords keep the bias active throughout.
+    """
+    names: list[str] = []
+    for entry in entries:
+        for candidate in (entry.canonical_name, *entry.aliases):
+            name = str(candidate).strip()
+            # Aliases are often the mishearing itself, so only the canonical
+            # spelling is boosted; single words carry the pronunciation anyway.
+            if name and name not in names and candidate == entry.canonical_name:
+                names.append(name)
+    selected: list[str] = []
+    used = 0
+    for name in names:
+        if used + len(name) + 2 > limit:
+            break
+        selected.append(name)
+        used += len(name) + 2
+    return ", ".join(selected)
 
 
 def build_initial_prompt(entries: Iterable[CampaignGuideEntry], limit: int = 4_000) -> str:
@@ -64,6 +91,7 @@ def process_transcription_job(
         .order_by(CampaignGuideEntry.kind, CampaignGuideEntry.canonical_name)
     ).all()
     prompt = build_initial_prompt(guide)
+    hotwords = build_hotwords(guide)
     source_path = _contained_path(settings.artifact_root, source.relative_path)
     output_dir = Path(str(game_session.campaign_id)) / str(game_session.id)
     normalized_relative = output_dir / "normalized" / f"{job.id}.wav"
@@ -79,13 +107,16 @@ def process_transcription_job(
     try:
         _normalize_audio(source_path, normalized_path)
         created_paths.append(normalized_path)
-        result = (transcribe or _faster_whisper_transcriber(settings))(normalized_path, prompt)
+        result = (transcribe or _faster_whisper_transcriber(settings))(
+            normalized_path, prompt, hotwords
+        )
         result.update(
             {
                 "schema_version": 1,
                 "source_artifact_id": str(source.id),
                 "normalized_audio_artifact_kind": "normalized_audio",
                 "campaign_prompt": prompt,
+                "campaign_hotwords": hotwords,
             }
         )
         _write_json_atomic(transcript_path, result)
@@ -149,10 +180,11 @@ def _faster_whisper_transcriber(settings: Settings) -> Transcribe:
         str(settings.model_root),
     )
 
-    def transcribe(audio_path: Path, prompt: str) -> dict[str, Any]:
+    def transcribe(audio_path: Path, prompt: str, hotwords: str = "") -> dict[str, Any]:
         segments, info = model.transcribe(
             str(audio_path),
             initial_prompt=prompt,
+            hotwords=hotwords or None,
             vad_filter=True,
             word_timestamps=True,
         )

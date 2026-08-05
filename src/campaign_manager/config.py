@@ -40,6 +40,10 @@ class Settings:
     analysis_max_output_tokens: int = 4_096
     analysis_chunk_chars: int = 16_000
     analysis_chunk_overlap_segments: int = 8
+    # Ollama holds a model in VRAM for 5 minutes by default. On a single card
+    # shared with transcription and image generation that blocks the next
+    # stage, so the model is released sooner than the gap between chunks.
+    analysis_keep_alive_seconds: int = 60
     otterwiki_repository_path: Path | None = None
 
     @classmethod
@@ -88,6 +92,9 @@ class Settings:
             analysis_chunk_overlap_segments=_integer_environment(
                 "CAMPAIGN_ANALYSIS_CHUNK_OVERLAP_SEGMENTS", 8
             ),
+            analysis_keep_alive_seconds=_integer_environment(
+                "CAMPAIGN_ANALYSIS_KEEP_ALIVE_SECONDS", 60
+            ),
             otterwiki_repository_path=(
                 Path(value) if (value := os.getenv("CAMPAIGN_OTTERWIKI_REPOSITORY_PATH")) else None
             ),
@@ -127,6 +134,7 @@ class Settings:
             "analysis_max_output_tokens": self.analysis_max_output_tokens,
             "analysis_chunk_chars": self.analysis_chunk_chars,
             "analysis_chunk_overlap_segments": self.analysis_chunk_overlap_segments,
+            "analysis_keep_alive_seconds": self.analysis_keep_alive_seconds,
             "otterwiki_publishing_configured": self.otterwiki_repository_path is not None,
             "log_level": self.log_level,
         }

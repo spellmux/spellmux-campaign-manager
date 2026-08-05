@@ -8,7 +8,7 @@ while every client uses the same fixed test password.
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 
 import pytest
 from sqlalchemy import event
@@ -44,7 +44,7 @@ def _memoize_password_verification(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     real_verify = auth.verify_password
 
-    @lru_cache(maxsize=None)
+    @cache
     def cached_verify(password: str, password_hash: str) -> bool:
         return real_verify(password, password_hash)
 
