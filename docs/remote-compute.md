@@ -47,6 +47,26 @@ no container runtime has to stay resident. The cost is a second dependency set a
 a second deployment target, so that deployment should be scripted rather than
 performed by hand.
 
+## Windows worker session context
+
+A remote worker on Windows must run in a session that can reach the artifact
+share, and not every session can. Verified against the reference deployment:
+
+| Session | Share reachable |
+| --- | --- |
+| interactive logon | yes |
+| OpenSSH session | no |
+| service or scheduled task as SYSTEM | no |
+
+The share itself is not the variable; a session that cannot reach it cannot reach
+any share on that host, including `IPC$`. So the worker has to run as a real user
+account with stored credentials, either as a scheduled task set to run whether
+that user is logged on or not, or as a service configured to log on as that user.
+Running it as SYSTEM does not work.
+
+Configure the artifact root as a UNC path rather than a mapped drive letter.
+Drive letters belong to one logon session and are invisible to a service.
+
 ## Single-accelerator constraints
 
 `HEAVY_JOB_KINDS` serializes heavy work across every worker, so two model stages
