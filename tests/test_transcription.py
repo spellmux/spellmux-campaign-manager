@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -96,3 +98,42 @@ def test_hotwords_spend_a_tight_budget_on_the_most_spoken_names() -> None:
     assert names[:2] == ["Caelen Myrhart", "Norixius Torrin"]
     assert "Mrs Thistle Tew" in names
     assert not any(name.startswith("Trinket") for name in names)
+
+
+def test_absolute_paths_are_refused_without_touching_the_filesystem(tmp_path) -> None:
+    # An absolute argument would otherwise replace the root entirely. This must
+    # hold before any I/O, so an unreachable root cannot mask a rejection.
+    for escape in ("/etc/passwd", r"C:\Windows\system.ini", r"\\other\share\file"):
+        with pytest.raises(ValueError, match="escapes"):
+            _contained_path(tmp_path, escape)
+
+
+def test_unreachable_artifact_root_reports_itself(tmp_path, monkeypatch) -> None:
+    # A remote artifact root makes resolve() a network call. An authenticated
+    # share resolves fine, but an unauthenticated one raises WinError 1326,
+    # which surfaced as "the user name or password is incorrect" on every job
+    # and named neither the root nor the real problem.
+    def refuse(self, *args, **kwargs):
+        raise OSError(1326, "The user name or password is incorrect")
+
+    monkeypatch.setattr(Path, "resolve", refuse)
+
+    with pytest.raises(OSError) as caught:
+        _contained_path(tmp_path, "campaign/audio.wav")
+
+    message = str(caught.value)
+    assert "not reachable from this session" in message
+    assert str(tmp_path) in message
+    assert "password is incorrect" in message
+
+
+def test_unc_artifact_root_is_recognised_and_contained() -> None:
+    if os.name != "nt":
+        pytest.skip("UNC paths are a Windows concept")
+    root = Path(r"\\Tower\campaign-artifacts")
+    # pathlib treats the server/share pair as the anchor, so the root is absolute
+    # and a relative artifact path stays underneath it.
+    assert root.is_absolute()
+    assert root.drive.startswith("\\\\")
+    combined = Path(os.path.normpath(root / "campaign/session/job.wav"))
+    assert combined.is_relative_to(Path(os.path.normpath(root)))

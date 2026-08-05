@@ -153,9 +153,27 @@ def process_transcription_job(
 
 
 def _contained_path(root: Path, relative: str | Path) -> Path:
-    root = root.resolve()
-    candidate = (root / relative).resolve()
-    if not candidate.is_relative_to(root):
+    """Join a relative artifact path to the root, refusing anything that escapes.
+
+    Containment is checked without touching the filesystem first, because a UNC
+    artifact root makes resolve() a network call: it fails with an opaque
+    "user name or password is incorrect" when the share is not authenticated in
+    the current session, which would otherwise surface as that error on every
+    job rather than as an unreachable artifact root.
+    """
+    combined = Path(os.path.normpath(root / relative))
+    normalized_root = Path(os.path.normpath(root))
+    if combined != normalized_root and not combined.is_relative_to(normalized_root):
+        raise ValueError("Artifact path escapes the configured artifact root")
+    try:
+        resolved_root = root.resolve()
+        candidate = (root / relative).resolve()
+    except OSError as exc:
+        raise OSError(
+            f"Artifact root {root} is not reachable from this session: {exc}"
+        ) from exc
+    # Re-check after resolution so a symlink cannot lead outside the root.
+    if candidate != resolved_root and not candidate.is_relative_to(resolved_root):
         raise ValueError("Artifact path escapes the configured artifact root")
     return candidate
 
