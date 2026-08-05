@@ -9,6 +9,7 @@ import uuid
 import wave
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,23 @@ from campaign_manager.config import Settings
 from campaign_manager.models import Artifact, GameSession, Job, SpeakerReview
 from campaign_manager.transcription import _contained_path
 
-Diarize = Callable[[Path], Iterable[tuple[float, float, str]]]
+
+@dataclass(frozen=True, slots=True)
+class DiarizationResult:
+    """Turns plus the per-cluster voice centroids the pipeline already computed.
+
+    Retaining centroids is what lets a confirmed cluster become a reusable
+    voiceprint. Cluster labels are session-local and arbitrary, so without them
+    every session has to be identified from scratch.
+    """
+
+    turns: list[tuple[float, float, str]]
+    embeddings: dict[str, list[float]] = field(default_factory=dict)
+    embedding_model: str = ""
+
+
+# Adapters may return only turns; centroids are an optional enrichment.
+Diarize = Callable[[Path], "DiarizationResult | Iterable[tuple[float, float, str]]"]
 
 MUSIC_DISPOSITIONS = {"music", "background_music", "featured_song"}
 UNUSABLE_VOICE_DISPOSITIONS = {"uncertain", "crosstalk", "noise"}
@@ -172,21 +189,28 @@ def process_diarization_job(
     session_id = game_session.id
     # Do not retain relation locks during hours-long model inference.
     database.commit()
+    result = as_diarization_result((diarize or _pyannote_diarizer(settings))(source_path))
     turns = [
         {"start": round(start, 3), "end": round(end, 3), "speaker": speaker}
-        for start, end, speaker in (diarize or _pyannote_diarizer(settings))(source_path)
+        for start, end, speaker in result.turns
         if end > start
     ]
     if not turns:
         raise ValueError("Diarization produced no speaker turns")
     document = {
-        "schema_version": 1,
+        # 2 adds per-cluster voice centroids so confirmed clusters can be enrolled.
+        "schema_version": 2,
         "provider": settings.diarization_provider,
         "model": settings.diarization_model,
+        "embedding_model": result.embedding_model,
         "source_artifact_id": str(source_id),
         "turns": turns,
         "clusters": [
-            {"label": label, "representative_clips": clips}
+            {
+                "label": label,
+                "representative_clips": clips,
+                "embedding": result.embeddings.get(label, []),
+            }
             for label, clips in sorted(representative_clips(turns).items())
         ],
     }
@@ -233,12 +257,49 @@ def _pyannote_diarizer(settings: Settings) -> Diarize:
         str(settings.model_root),
     )
 
-    def diarize(path: Path) -> Iterable[tuple[float, float, str]]:
+    def diarize(path: Path) -> DiarizationResult:
         output = pipeline(_load_pcm_wav(path))
         annotation = output.exclusive_speaker_diarization
-        return ((turn.start, turn.end, speaker) for turn, speaker in annotation)
+        return DiarizationResult(
+            turns=[(turn.start, turn.end, speaker) for turn, speaker in annotation],
+            embeddings=_speaker_centroids(output),
+            embedding_model=settings.diarization_model,
+        )
 
     return diarize
+
+
+def _speaker_centroids(output: Any) -> dict[str, list[float]]:
+    """Extract per-label voice centroids from a pyannote diarization output.
+
+    pyannote orders `speaker_embeddings` rows to match the diarization's labels,
+    and zero-pads when it found fewer centroids than speakers. Padded rows carry
+    no voice information, so they are dropped rather than enrolled.
+    """
+    embeddings = getattr(output, "speaker_embeddings", None)
+    if embeddings is None:
+        return {}
+    labelled = getattr(output, "speaker_diarization", None) or getattr(
+        output, "exclusive_speaker_diarization", None
+    )
+    labels = list(labelled.labels()) if labelled is not None else []
+    centroids: dict[str, list[float]] = {}
+    for index, label in enumerate(labels):
+        if index >= len(embeddings):
+            break
+        vector = [float(value) for value in embeddings[index]]
+        if any(vector):
+            centroids[str(label)] = vector
+    return centroids
+
+
+def as_diarization_result(
+    value: DiarizationResult | Iterable[tuple[float, float, str]],
+) -> DiarizationResult:
+    """Accept either shape from an adapter so existing providers keep working."""
+    if isinstance(value, DiarizationResult):
+        return value
+    return DiarizationResult(turns=[(start, end, speaker) for start, end, speaker in value])
 
 
 def _load_pcm_wav(path: Path) -> dict[str, Any]:

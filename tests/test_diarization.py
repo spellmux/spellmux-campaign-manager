@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import pytest
 
 from campaign_manager.diarization import (
+    DiarizationResult,
     _load_pcm_wav,
+    _speaker_centroids,
+    as_diarization_result,
     attribute_transcript_segments,
     cluster_resolutions,
     representative_clips,
@@ -109,3 +112,33 @@ def test_load_pcm_wav_returns_in_memory_waveform(tmp_path) -> None:
 
     assert audio["sample_rate"] == 16_000
     assert tuple(audio["waveform"].shape) == (1, 160)
+
+
+def test_diarization_retains_voice_centroids_for_enrollment() -> None:
+    class FakeAnnotation:
+        def labels(self):
+            return ["SPEAKER_00", "SPEAKER_01", "SPEAKER_02"]
+
+    # pyannote zero-pads when it finds fewer centroids than speakers.
+    output = SimpleNamespace(
+        speaker_diarization=FakeAnnotation(),
+        speaker_embeddings=[[0.1, 0.2], [0.3, 0.4], [0.0, 0.0]],
+    )
+
+    centroids = _speaker_centroids(output)
+
+    assert centroids == {"SPEAKER_00": [0.1, 0.2], "SPEAKER_01": [0.3, 0.4]}
+
+
+def test_diarization_accepts_adapters_that_return_only_turns() -> None:
+    # Existing providers yield plain tuples; centroids are an optional enrichment.
+    plain = as_diarization_result([(0.0, 1.0, "SPEAKER_00"), (1.0, 2.0, "SPEAKER_01")])
+    assert plain.turns == [(0.0, 1.0, "SPEAKER_00"), (1.0, 2.0, "SPEAKER_01")]
+    assert plain.embeddings == {}
+
+    enriched = DiarizationResult(
+        turns=[(0.0, 1.0, "SPEAKER_00")],
+        embeddings={"SPEAKER_00": [1.0, 0.0]},
+        embedding_model="pyannote/speaker-diarization-community-1",
+    )
+    assert as_diarization_result(enriched) is enriched

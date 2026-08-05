@@ -33,6 +33,40 @@ from campaign_manager.models import (
 )
 from campaign_manager.review import read_artifact
 
+GM_SPEAKER_LABEL = "GM"
+UNKNOWN_SPEAKER_LABEL = "Unidentified speaker"
+RESERVED_SPEAKER_LABELS = frozenset({GM_SPEAKER_LABEL.casefold(), UNKNOWN_SPEAKER_LABEL.casefold()})
+_RAW_CLUSTER_LABEL = re.compile(r"^\s*speaker[_\s-]*\d+\s*$", re.IGNORECASE)
+
+
+def narration_speaker(segment: dict[str, Any]) -> str:
+    """Return the name to attribute a transcript line to.
+
+    Real player names never reach the model. A player's name in front of every
+    line is what produced findings like "Lyndon's Grapple Attempt" and entities
+    described as "Player Lyndon controls Norixius Torrin", and raw cluster labels
+    produced entities named "SPEAKER_01 (Bit)". Resolving to the character, the
+    GM role, or an explicit unknown makes both impossible to express.
+    """
+    character = str(segment.get("character_name") or "").strip()
+    if character:
+        return character
+    if segment.get("speaker_profile_id") or segment.get("speaker_name"):
+        # A known human with no character is the GM voicing the world.
+        return GM_SPEAKER_LABEL
+    if segment.get("speaker"):
+        return UNKNOWN_SPEAKER_LABEL
+    return ""
+
+
+def is_reserved_speaker_name(value: str) -> bool:
+    """True when a name is a transcript role or cluster label, never a character."""
+    candidate = value.strip().casefold()
+    if not candidate:
+        return False
+    return candidate in RESERVED_SPEAKER_LABELS or bool(_RAW_CLUSTER_LABEL.match(candidate))
+
+
 KIND_ALIASES = {
     "event": "scene", "scene_event": "scene", "moment": "memorable_moment",
     "summary": "session_summary", "recap": "session_summary",
@@ -461,13 +495,26 @@ def process_analysis_job(
         )
         .order_by(SpeakerProfile.display_name, SpeakerCharacterAssignment.is_primary.desc())
     ).all()
+    # Resolve each speaker to their character so transcript lines can be attributed
+    # in character. Primary assignments win; ordering above puts them first.
+    character_by_speaker: dict[str, str] = {}
+    for assignment, speaker, character in assignment_rows:
+        character_by_speaker.setdefault(str(speaker.id), character.canonical_name)
+    for segment in segments:
+        profile_id = segment.get("speaker_profile_id")
+        character_name = character_by_speaker.get(str(profile_id)) if profile_id else None
+        if character_name:
+            segment["character_name"] = character_name
     speaker_context = [
-        f"{speaker.display_name} plays {character.canonical_name}"
-        f"{' (primary)' if assignment.is_primary else ''}"
+        f"{character.canonical_name} is a player character"
+        f"{' (primary voice)' if assignment.is_primary else ''}"
         f"{' for this session' if assignment.session_id else ''}"
         f"; notes={assignment.notes or 'none'}"
         for assignment, speaker, character in assignment_rows
     ]
+    speaker_context.append(
+        f"{GM_SPEAKER_LABEL} is the game master describing the world and voicing NPCs"
+    )
     player_character_ids = {character.id for _assignment, _speaker, character in assignment_rows}
     chunk_limit = min(settings.analysis_max_input_chars, settings.analysis_chunk_chars)
     prompts = build_analysis_prompts(
@@ -736,8 +783,14 @@ def canonicalize_character_kinds(
     normalized = []
     for original in proposals:
         proposal = original.model_copy(deep=True)
+        proposal.aliases = _scoped_aliases(proposal, guide)
         if proposal.kind not in entity_kinds:
             normalized.append(proposal)
+            continue
+        bare_title = re.sub(r"\s*\([^)]*\)\s*$", "", proposal.title).strip()
+        if is_reserved_speaker_name(bare_title) or is_reserved_speaker_name(proposal.title):
+            # The GM and unidentified speakers are transcript roles. Promoting one
+            # created entities such as "Tim (Host)" and "SPEAKER_01 (Bit)".
             continue
         title_key = re.sub(r"\s*\([^)]*\)\s*$", "", proposal.title).strip().casefold()
         match = None
@@ -762,6 +815,37 @@ def canonicalize_character_kinds(
             proposal.title = re.sub(r"\s*\([^)]*\)\s*$", "", proposal.title).strip()
         normalized.append(proposal)
     return normalized
+
+
+def _scoped_aliases(
+    proposal: ExtractedProposal, guide: list[CampaignGuideEntry]
+) -> list[str]:
+    """Drop aliases that demonstrably belong to a different guide entity.
+
+    The guide is injected into every chunk prompt with its aliases, and models
+    echo them back onto unrelated findings: one run stamped a single entity's
+    alias onto five others, which on approval would have merged them. Aliases the
+    guide has never seen are kept, since new spellings are the point of the field.
+    """
+    if not proposal.aliases:
+        return proposal.aliases
+    owner: dict[str, str] = {}
+    for entry in guide:
+        identity = str(entry.canonical_name).strip().casefold()
+        for name in (entry.canonical_name, *entry.aliases):
+            text = str(name).strip().casefold()
+            if text:
+                owner.setdefault(text, identity)
+    own = owner.get(proposal.title.strip().casefold())
+    kept: list[str] = []
+    for alias in proposal.aliases:
+        text = alias.strip().casefold()
+        if not text or is_reserved_speaker_name(alias):
+            continue
+        holder = owner.get(text)
+        if holder is None or holder == own:
+            kept.append(alias)
+    return kept
 
 
 def build_analysis_prompts(
@@ -1032,15 +1116,33 @@ def _recap_needs_coverage_retry(
 def _unsupported_identity_thread(
     proposal: ExtractedProposal, guide: list[CampaignGuideEntry]
 ) -> bool:
+    """Drop threads that merge two player characters without textual support.
+
+    Matching is per entity across canonical name and aliases, on word boundaries.
+    Canonical-name-only substring matching both missed real merges, because
+    "Magnus vs. Torin" names neither "Magnus Heartsbane" nor "Norixius Torrin"
+    in full, and fired falsely, because "Bit" is a substring of "rabbit".
+    """
     if proposal.kind != "unresolved_question":
         return False
-    player_names = [entry.canonical_name for entry in guide if entry.kind == "player_character"]
-    mentioned = [name for name in player_names if name.casefold() in f"{proposal.title} {proposal.body}".casefold()]
-    if len(mentioned) < 2:
+    text = f"{proposal.title} {proposal.body}"
+    mentioned = sum(
+        1 for entry in guide
+        if entry.kind == "player_character" and _mentions_entity(text, entry)
+    )
+    if mentioned < 2:
         return False
-    text = f"{proposal.title} {proposal.body}".casefold()
     explicit = ("also known as", "alias", "revealed to be", "is actually", "same person", "impersonat")
-    return not any(term in text for term in explicit)
+    return not any(term in text.casefold() for term in explicit)
+
+
+def _mentions_entity(text: str, entry: CampaignGuideEntry) -> bool:
+    """True when text names this entity by canonical name or any alias."""
+    for name in (entry.canonical_name, *entry.aliases):
+        candidate = str(name).strip()
+        if candidate and re.search(rf"\b{re.escape(candidate)}\b", text, re.IGNORECASE):
+            return True
+    return False
 
 
 def _first_evidence_segment(proposal: ExtractedProposal) -> int:
@@ -1197,7 +1299,7 @@ Session description: {game_session.description or 'none'}
 Campaign truth and spelling guide:
 {chr(10).join(guide_lines) or '- none'}
 
-Player-to-character context (guidance, not proof that every utterance is in character):
+Speakers in this transcript (already resolved; real player names are deliberately withheld):
 {chr(10).join(f'- {line}' for line in (speaker_context or [])) or '- none'}
 
 Rules:
@@ -1208,6 +1310,9 @@ Rules:
 - meta: explicit rulings, promised/deferred follow-ups, useful scheduling, attendance, or technical notes.
 - Ignore greetings, food, interruptions, cross-talk, incidental jokes, inconclusive lookup, and transcript noise.
 - Speakers are not automatically their PCs. Mark secrets and uncertain identity GM-only.
+- "{GM_SPEAKER_LABEL}" and "{UNKNOWN_SPEAKER_LABEL}" are transcript roles, never characters. Never make an
+  entity for them, never treat them as an NPC, and never use them in a title.
+- Name people only by character name. Do not describe a character in terms of who plays them.
 - Return exactly one JSON object with a "proposals" array and no surrounding commentary.
 - Each proposal contains kind, title, body, aliases, evidence, confidence, visibility.
 - kinds: session_summary, player_character, npc, monster, location, item, spell, creature, quest,
@@ -1223,7 +1328,7 @@ Source segments:
         timing = ""
         if segment.get("start") is not None:
             timing = f" {segment.get('start'):.2f}-{segment.get('end', segment.get('start')):.2f}s"
-        speaker = segment.get("speaker_name") or segment.get("speaker")
+        speaker = narration_speaker(segment)
         attribution = f" {speaker}:" if speaker else ""
         line = f"[{index}{timing}]{attribution} {str(segment.get('text', '')).strip()}"
         if len(line) + 1 > remaining:

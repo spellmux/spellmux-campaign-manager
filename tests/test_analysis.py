@@ -11,6 +11,7 @@ from campaign_manager.analysis import (
     PROPOSAL_KINDS,
     AnalysisResult,
     ExtractedProposal,
+    _unsupported_identity_thread,
     build_analysis_prompt,
     build_analysis_prompts,
     canonicalize_character_kinds,
@@ -201,7 +202,9 @@ def test_analysis_prompts_cover_long_source_with_overlap_and_global_ids(tmp_path
         for index in range(40)
     ]
 
-    prompts = build_analysis_prompts(session, [], segments, max_chars=2_200, overlap_segments=2)
+    # The budget must leave room for enough segments per chunk that overlap applies;
+    # build_analysis_prompts scales overlap down to zero for very short chunks.
+    prompts = build_analysis_prompts(session, [], segments, max_chars=4_000, overlap_segments=2)
 
     assert len(prompts) > 1
     covered = {index for _prompt, included in prompts for index, _segment in included}
@@ -620,17 +623,109 @@ def test_character_classification_uses_campaign_guide_and_removes_annotations() 
     ]
 
 
-def test_prompt_includes_resolved_speaker_attribution(tmp_path) -> None:
+def test_prompt_attributes_lines_to_characters_and_withholds_player_names(tmp_path) -> None:
     session = GameSession(title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
-    prompt, _ = build_analysis_prompt(
-        session, [], [{"start": 12.0, "end": 15.0, "speaker_name": "Rob", "text": "I open the door."}], 2_000,
-        speaker_context=["Rob plays Caelen (primary); notes=none"],
-    )
+    segments = [
+        # A speaker resolved to a character: narrate as the character.
+        {"start": 12.0, "end": 15.0, "speaker": "SPEAKER_00", "speaker_name": "Rob",
+         "speaker_profile_id": "p1", "character_name": "Caelen", "text": "I open the door."},
+        # A known human with no character is the GM voicing the world.
+        {"start": 16.0, "end": 18.0, "speaker": "SPEAKER_01", "speaker_name": "Rob's friend",
+         "speaker_profile_id": "p2", "text": "The door creaks open."},
+        # An unreviewed cluster must never surface its raw label.
+        {"start": 19.0, "end": 21.0, "speaker": "SPEAKER_02", "text": "Someone laughs."},
+    ]
 
-    assert "Rob: I open the door." in prompt
-    assert "Rob plays Caelen (primary)" in prompt
+    prompt, _ = build_analysis_prompt(session, [], segments, 4_000)
+
+    assert "Caelen: I open the door." in prompt
+    assert "GM: The door creaks open." in prompt
+    assert "Unidentified speaker: Someone laughs." in prompt
+    # Real names and raw cluster labels are the source of player/character mix-ups.
+    assert "Rob" not in prompt
+    assert "SPEAKER_0" not in prompt
     assert 'Return exactly one JSON object with a "proposals" array' in prompt
     assert "session_summary, player_character, npc, monster" in prompt
+
+
+def _guide_entry(kind: str, name: str, aliases: list[str], campaign_id: uuid.UUID):
+    return CampaignGuideEntry(
+        id=uuid.uuid4(), campaign_id=campaign_id, kind=kind, canonical_name=name,
+        aliases=aliases, notes="", visibility="gm", created_by_id=uuid.uuid4(),
+    )
+
+
+def test_identity_guards_derive_from_campaign_data_not_hardcoded_names() -> None:
+    # A different campaign with different characters must get identical treatment,
+    # so every guard is driven by guide entries rather than known names.
+    campaign_id = uuid.uuid4()
+    vess = _guide_entry("player_character", "Vess Aldermoor", ["Vess", "Aldermoor"], campaign_id)
+    kip = _guide_entry("player_character", "Kip", [], campaign_id)
+    guide = [vess, kip]
+
+    # Alias-aware: "Aldermoor" and "Kip" name two PCs even though neither
+    # canonical name appears in full.
+    merged = ExtractedProposal.model_validate({
+        "kind": "unresolved_question", "title": "Is Aldermoor secretly Kip?",
+        "body": "The innkeeper implies they are the same.", "aliases": [],
+        "confidence": 0.6, "visibility": "gm", "evidence": [],
+    })
+    assert _unsupported_identity_thread(merged, guide) is True
+
+    # Explicit identity language is legitimate and must survive.
+    supported = ExtractedProposal.model_validate({
+        "kind": "unresolved_question", "title": "Aldermoor revealed to be Kip",
+        "body": "Vess is actually Kip, revealed to be the same person.", "aliases": [],
+        "confidence": 0.9, "visibility": "gm", "evidence": [],
+    })
+    assert _unsupported_identity_thread(supported, guide) is False
+
+    # Word boundaries: a short PC name must not match inside another word.
+    # "Kip" appears inside "Kipling", which previously tripped the guard.
+    incidental = ExtractedProposal.model_validate({
+        "kind": "unresolved_question", "title": "Who owns the Kipling estate?",
+        "body": "Vess Aldermoor asks about the Kipling estate.", "aliases": [],
+        "confidence": 0.5, "visibility": "gm", "evidence": [],
+    })
+    assert _unsupported_identity_thread(incidental, guide) is False
+
+
+def test_reserved_speaker_roles_never_become_entities() -> None:
+    campaign_id = uuid.uuid4()
+    guide = [_guide_entry("player_character", "Vess Aldermoor", ["Vess"], campaign_id)]
+    proposals = [ExtractedProposal.model_validate({
+        "kind": kind, "title": title, "body": "Spoke during the session.",
+        "aliases": [], "confidence": 0.8, "visibility": "gm", "evidence": [],
+    }) for kind, title in [
+        ("npc", "GM"),
+        ("npc", "GM (Host)"),
+        ("player_character", "SPEAKER_01 (Kip)"),
+        ("npc", "Unidentified speaker"),
+        ("npc", "Brannock the Smith"),
+    ]]
+
+    result = canonicalize_character_kinds(proposals, guide, {guide[0].id})
+
+    # Only the real in-fiction NPC survives.
+    assert [proposal.title for proposal in result] == ["Brannock the Smith"]
+
+
+def test_aliases_belonging_to_another_entity_are_dropped() -> None:
+    campaign_id = uuid.uuid4()
+    guide = [
+        _guide_entry("character", "Hollow Empress", ["Empress Nihil"], campaign_id),
+        _guide_entry("player_character", "Vess Aldermoor", ["Vess"], campaign_id),
+    ]
+    proposal = ExtractedProposal.model_validate({
+        "kind": "player_character", "title": "Vess Aldermoor",
+        "body": "A ranger.", "confidence": 0.9, "visibility": "player", "evidence": [],
+        # "Empress Nihil" belongs to a different entity; "Vessa" is a new spelling.
+        "aliases": ["Vess", "Empress Nihil", "Vessa", "GM"],
+    })
+
+    result = canonicalize_character_kinds([proposal], guide, {guide[1].id})
+
+    assert result[0].aliases == ["Vess", "Vessa"]
 
 
 def test_analysis_status_is_disabled_by_default(tmp_path) -> None:
