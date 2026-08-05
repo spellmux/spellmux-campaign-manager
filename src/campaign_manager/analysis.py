@@ -9,7 +9,8 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable
-from dataclasses import replace
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -1029,6 +1030,111 @@ def _deduplicate_consolidation_candidates(
     return ordered
 
 
+@dataclass(frozen=True, slots=True)
+class SectionSpec:
+    name: str
+    # Kinds the grammar will permit in the response.
+    output_kinds: tuple[str, ...]
+    # Kinds drawn from the extracted findings as input material.
+    input_kinds: frozenset[str]
+    # Which candidate-selection strategy to use.
+    candidate_source: str
+    instruction: str
+    # None means keep everything the model returns.
+    maximum: int | None
+    required: bool = False
+
+
+_ENTITY_OUTPUT_KINDS = (
+    "player_character", "npc", "monster", "location", "item", "spell",
+    "creature", "faction", "deity",
+)
+_NARRATIVE_INPUT_KINDS = frozenset({
+    "scene", "memorable_moment", "important_decision", "quest",
+    "unresolved_question", "player_character", "npc", "location",
+})
+REQUIRED_KINDS = frozenset({"session_summary"})
+
+SECTIONS: tuple[SectionSpec, ...] = (
+    SectionSpec(
+        name="recap",
+        # Only a recap is expressible here, so scenes cannot crowd it out.
+        output_kinds=("session_summary",),
+        input_kinds=_NARRATIVE_INPUT_KINDS,
+        candidate_source="narrative",
+        instruction=(
+            "Write the session recap. Return exactly one entry of 5-7 paragraphs and "
+            "roughly 350-650 words covering the opening, the major turning points, the "
+            "choices characters made, the escalating conflict, and how it ended. Ground "
+            "it across the whole session rather than the opening scene, and cite "
+            "evidence from early, middle, and late segments."
+        ),
+        maximum=1,
+        required=True,
+    ),
+    SectionSpec(
+        name="scenes",
+        output_kinds=("scene", "memorable_moment"),
+        input_kinds=frozenset({"scene", "memorable_moment"}),
+        candidate_source="narrative",
+        instruction=(
+            "Return 6-10 scene entries in chronological order, each under 90 words, and "
+            "up to 4 memorable_moment entries under 60 words. Merge duplicates that "
+            "describe the same beat."
+        ),
+        maximum=14,
+    ),
+    SectionSpec(
+        name="entities",
+        output_kinds=_ENTITY_OUTPUT_KINDS,
+        input_kinds=frozenset(_ENTITY_OUTPUT_KINDS),
+        candidate_source="entities",
+        instruction=(
+            "Return canonical reusable entity updates only. Merge duplicates, use "
+            "canonical-name-only titles, and keep each body under 100 words. An action "
+            "or reaction is not an entity."
+        ),
+        maximum=14,
+    ),
+    SectionSpec(
+        name="threads",
+        output_kinds=("quest", "important_decision", "unresolved_question"),
+        input_kinds=frozenset({"quest", "important_decision", "unresolved_question"}),
+        candidate_source="threads",
+        instruction=(
+            "Return meaningful quests, consequential decisions, and genuine in-fiction "
+            "open questions. Remove transcript ambiguity and table chatter. Keep each "
+            "body under 90 words."
+        ),
+        maximum=10,
+    ),
+    SectionSpec(
+        name="meta",
+        output_kinds=("rule", "follow_up", "table_note"),
+        input_kinds=frozenset({"rule", "follow_up", "table_note"}),
+        candidate_source="meta",
+        instruction=(
+            "Return durable rules rulings, explicit follow-ups, and useful scheduling or "
+            "technical notes. Remove ordinary table chatter. Keep each body under 80 words."
+        ),
+        maximum=10,
+    ),
+)
+
+
+def _section_schema(output_kinds: tuple[str, ...]) -> dict[str, Any]:
+    """Restrict the response grammar to one section's kinds.
+
+    Enforcing this in the sampling grammar rather than the prompt is the point: a
+    section told in prose to return only a recap returned scenes and entities and
+    no recap, and no amount of post-hoc filtering recovers what was never sampled.
+    """
+    schema = deepcopy(ANALYSIS_RESPONSE_SCHEMA)
+    item = schema["properties"]["proposals"]["items"]
+    item["properties"]["kind"]["enum"] = list(output_kinds)
+    return schema
+
+
 def _finalize_analysis_sections(
     game_session: GameSession,
     guide: list[CampaignGuideEntry],
@@ -1037,90 +1143,74 @@ def _finalize_analysis_sections(
     analyzer: Analyze,
     model: str,
 ) -> tuple[AnalysisResult, list[dict[str, Any]]]:
-    """Generate bounded Chronicle-shaped sections instead of one oversized response."""
-    groups = [
-        (
-            "narrative",
-            {"scene", "memorable_moment", "important_decision", "quest", "unresolved_question", "player_character", "npc", "location"},
-            12,
-            "Return exactly one session_summary of 5-7 paragraphs and roughly 350-650 words. It must cover the session opening, major turning points, character choices, escalating conflict, and ending/consequences. Also return 6-10 chronological scene entries (<=90 words each), and up to 4 memorable_moment entries (<=60 words each). Return no entity or meta entries.",
-        ),
-        (
-            "entities",
-            {"player_character", "npc", "monster", "location", "item", "spell", "creature", "faction", "deity"},
-            12,
-            "Return only canonical reusable entity updates. Merge duplicates, use canonical-name-only titles, and keep each body under 100 words. Do not return scenes or actions as entities.",
-        ),
-        (
-            "threads",
-            {"quest", "important_decision", "unresolved_question"},
-            8,
-            "Return only meaningful quests, consequential decisions, and genuine in-fiction open story threads. Remove transcript ambiguity and table chatter. Keep each body under 90 words.",
-        ),
-        (
-            "meta",
-            {"rule", "follow_up", "table_note"},
-            8,
-            "Return only durable rules rulings, explicit follow-ups/to-dos, and useful scheduling or technical notes. Remove ordinary table chatter. Keep each body under 80 words.",
-        ),
-    ]
+    """Build each Chronicle section under a schema that only permits its own kinds.
+
+    Asking one prompt to select, rewrite, and respect kind restrictions did not
+    work: given a section instruction to return exactly one recap and no entities,
+    the model returned eleven scenes, several entities, and no recap at all. The
+    kinds a section may contain are now enforced by the sampling grammar instead of
+    requested in prose, and the recap is its own call so nothing competes with it.
+    """
     combined: list[ExtractedProposal] = []
     metadata: list[dict[str, Any]] = []
-    for group_name, kinds, limit, instruction in groups:
-        candidates = _section_candidates(proposals, group_name, kinds)
+    for section in SECTIONS:
+        candidates = _section_candidates(proposals, section.candidate_source, section.input_kinds)
         if not candidates:
             continue
         prompt = _section_consolidation_prompt(
-            game_session, guide, speaker_context, group_name, instruction, candidates
+            game_session, guide, speaker_context, section.name, section.instruction, candidates
         )
-        result, response = analyzer(prompt, model, ANALYSIS_RESPONSE_SCHEMA)
-        if group_name == "threads":
-            result.proposals = [
-                proposal for proposal in result.proposals
-                if not _unsupported_identity_thread(proposal, guide)
-            ]
-        if group_name == "narrative" and not any(
-            proposal.kind == "session_summary" for proposal in result.proposals
-        ):
+        schema = _section_schema(section.output_kinds)
+        result, response = analyzer(prompt, model, schema)
+        # The grammar restricts kinds, but an empty array is still expressible.
+        if not result.proposals and section.required:
             retry_prompt = prompt + (
-                "\nCRITICAL REQUIREMENT: this section is incomplete without exactly one proposal with "
-                "kind=session_summary. Return that recap first, followed by concise scene entries."
+                f"\nThis section is empty without at least one {section.output_kinds[0]} entry. "
+                "Return it now."
             )
-            retry_result, retry_response = analyzer(
-                retry_prompt, model, ANALYSIS_RESPONSE_SCHEMA
-            )
-            result.proposals = [*retry_result.proposals, *result.proposals]
+            result, retry_response = analyzer(retry_prompt, model, schema)
             response = {**response, "retry": retry_response}
-        if group_name == "narrative" and _recap_needs_coverage_retry(result, candidates):
-            coverage_prompt = prompt + (
-                "\nCRITICAL COVERAGE REQUIREMENT: the recap must be grounded in the whole session. "
-                "Use evidence from at least three distinct chronological regions, including the final "
-                "major event or consequence. Do not spend the recap only on the opening scene."
-            )
-            coverage_result, coverage_response = analyzer(
-                coverage_prompt, model, ANALYSIS_RESPONSE_SCHEMA
-            )
-            if any(proposal.kind == "session_summary" for proposal in coverage_result.proposals):
-                # The wider recap supersedes the narrow one. Keeping both would not publish two
-                # recaps; merging keys every session_summary to one entry, so the reviewed recap
-                # would be both drafts concatenated.
-                result.proposals = [
-                    proposal for proposal in result.proposals
-                    if proposal.kind != "session_summary"
-                ]
-            result.proposals = [*coverage_result.proposals, *result.proposals]
-            response = {**response, "coverage_retry": coverage_response}
-        if group_name == "narrative" and not any(
-            proposal.kind == "session_summary" for proposal in result.proposals
-        ):
-            raise ValueError("Narrative consolidation returned no session_summary")
-        combined.extend(result.proposals[:limit])
-        metadata.append({"stage": "finalizing", "section": group_name, **response})
-    return AnalysisResult(proposals=combined[:40]), metadata
+        kept = [p for p in result.proposals if p.kind in section.output_kinds]
+        if section.name == "threads":
+            kept = [p for p in kept if not _unsupported_identity_thread(p, guide)]
+        if section.required and not kept:
+            response = {**response, "missing_required_section": section.name}
+        combined.extend(_trim_section(kept, section))
+        metadata.append({"stage": "finalizing", "section": section.name, **response})
+    return AnalysisResult(proposals=_bounded_result(combined)), metadata
+
+
+def _trim_section(
+    proposals: list[ExtractedProposal], section: SectionSpec
+) -> list[ExtractedProposal]:
+    """Drop the least confident surplus rather than whatever arrived last.
+
+    Trimming by arrival position assumed the model emits in importance order,
+    which is how a required recap was discarded while the check that demanded it
+    passed against the untrimmed list.
+    """
+    if section.maximum is None or len(proposals) <= section.maximum:
+        return proposals
+    if section.name == "scenes":
+        # Scenes are a chronological outline, so keep the earliest ones in order
+        # rather than the most confident ones out of order.
+        return sorted(proposals, key=_first_evidence_segment)[: section.maximum]
+    return sorted(proposals, key=lambda p: p.confidence, reverse=True)[: section.maximum]
+
+
+def _bounded_result(proposals: list[ExtractedProposal]) -> list[ExtractedProposal]:
+    """Respect the response ceiling without letting a required kind fall off."""
+    ceiling = 40
+    if len(proposals) <= ceiling:
+        return proposals
+    required = [p for p in proposals if p.kind in REQUIRED_KINDS]
+    optional = [p for p in proposals if p.kind not in REQUIRED_KINDS]
+    optional.sort(key=lambda p: p.confidence, reverse=True)
+    return [*required[:ceiling], *optional[: max(0, ceiling - len(required))]]
 
 
 def _section_candidates(
-    proposals: list[ExtractedProposal], section: str, kinds: set[str]
+    proposals: list[ExtractedProposal], section: str, kinds: frozenset[str] | set[str]
 ) -> list[ExtractedProposal]:
     candidates = [proposal for proposal in proposals if proposal.kind in kinds]
     if section == "narrative":
@@ -1155,22 +1245,6 @@ def _spread_chronological_scenes(scenes: list[ExtractedProposal]) -> list[Extrac
             seen.add(identity)
             result.append(scene)
     return result
-
-
-def _recap_needs_coverage_retry(
-    result: AnalysisResult, candidates: list[ExtractedProposal]
-) -> bool:
-    summary = next((proposal for proposal in result.proposals if proposal.kind == "session_summary"), None)
-    scene_ids = [identifier for proposal in candidates if proposal.kind == "scene"
-                 for evidence in proposal.evidence for identifier in evidence.segment_ids]
-    summary_ids = [identifier for evidence in (summary.evidence if summary else [])
-                   for identifier in evidence.segment_ids]
-    if summary is None or len(summary.body.split()) < 250 or len(scene_ids) < 4 or not summary_ids:
-        return True
-    low, high = min(scene_ids), max(scene_ids)
-    span = max(1, high - low)
-    regions = {(identifier - low) * 4 // span for identifier in summary_ids}
-    return len(regions) < 3
 
 
 def _unsupported_identity_thread(

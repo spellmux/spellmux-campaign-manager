@@ -9,8 +9,11 @@ from test_auth_campaigns import configured_client, create_campaign_and_session, 
 from campaign_manager.analysis import (
     ANALYSIS_RESPONSE_SCHEMA,
     PROPOSAL_KINDS,
+    SECTIONS,
     AnalysisResult,
     ExtractedProposal,
+    _bounded_result,
+    _trim_section,
     _unsupported_identity_thread,
     assign_speaker_pseudonyms,
     build_analysis_prompt,
@@ -522,7 +525,7 @@ def test_consolidation_separates_story_from_meta_and_merges_entities() -> None:
 
     def fake_analyze(prompt, model, schema):
         captured.append(prompt)
-        if "narrative section" in prompt:
+        if "recap section" in prompt:
             proposals = [{
                 "kind": "session_summary", "title": "Session recap", "body": "Magnus performed.",
                 "aliases": [], "confidence": 0.9, "visibility": "player",
@@ -551,45 +554,105 @@ def test_consolidation_separates_story_from_meta_and_merges_entities() -> None:
     assert [proposal.title for proposal in result.proposals].count("Magnus Heartsbane") == 1
     assert next(p for p in result.proposals if p.kind == "follow_up").lane == "meta"
     assert next(p for p in result.proposals if p.kind == "session_summary").lane == "story"
-    # Narrative, its coverage retry, entities, then meta; threads has no candidates.
-    assert len(captured) == 4
-    assert sum("COVERAGE REQUIREMENT" in prompt for prompt in captured) == 1
     assert all("Speakers are not automatically their PCs" in prompt for prompt in captured)
-    assert {item["section"] for item in metadata} == {"narrative", "entities", "meta"}
+    # Sections with no candidates are skipped, so scenes and threads do not run here.
+    assert {item["section"] for item in metadata} == {"recap", "entities", "meta"}
 
 
-def test_narrative_coverage_retry_replaces_the_narrow_recap() -> None:
-    session = GameSession(
-        title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4()
-    )
-    candidates = [ExtractedProposal.model_validate({
-        "kind": "scene", "title": f"Scene {segment}", "body": f"Something happens at {segment}.",
-        "aliases": [], "confidence": 0.9, "visibility": "player",
-        "evidence": [{"segment_ids": [segment], "quote": f"line {segment}"}],
-    }) for segment in (1, 20, 40, 60, 80)]
-    narrow = "The party met in the tavern. " * 20
-    full = "The party met, travelled, fought, and returned changed. " * 40
+def test_each_section_may_only_return_its_own_kinds() -> None:
+    # The observed failure: told in prose to return one recap and no entities, the
+    # model returned eleven scenes, several entities, and no recap. The grammar now
+    # makes that unexpressible, so assert the schema handed to each section.
+    seen: dict[str, list[str]] = {}
 
     def fake_analyze(prompt, model, schema):
-        body = full if "COVERAGE REQUIREMENT" in prompt else narrow
+        enum = schema["properties"]["proposals"]["items"]["properties"]["kind"]["enum"]
+        section = next(s.name for s in SECTIONS if s.instruction[:40] in prompt)
+        seen[section] = enum
         return AnalysisResult.model_validate({"proposals": [{
-            "kind": "session_summary", "title": "Session recap", "body": body,
-            "aliases": [], "confidence": 0.9, "visibility": "player",
-            "evidence": [{"segment_ids": [1, 40, 80], "quote": "line 1"}],
-        }]}), {"eval_count": 30}
+            "kind": enum[0], "title": f"{section} entry", "body": "Body.",
+            "aliases": [], "confidence": 0.9, "visibility": "gm",
+            "evidence": [{"segment_ids": [1], "quote": "q"}],
+        }]}), {"eval_count": 5}
+
+    session = GameSession(
+        title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
+    candidates = [ExtractedProposal.model_validate({
+        "kind": kind, "title": f"{kind} candidate", "body": "Body.", "aliases": [],
+        "confidence": 0.8, "visibility": "gm",
+        "evidence": [{"segment_ids": [index], "quote": "q"}],
+    }) for index, kind in enumerate(
+        ["scene", "npc", "quest", "rule", "memorable_moment", "item"])]
+
+    consolidate_analysis(session, [], [], candidates, fake_analyze, "m", 20_000)
+
+    assert seen["recap"] == ["session_summary"], "a recap section must not permit scenes"
+    assert "session_summary" not in seen["scenes"]
+    assert "session_summary" not in seen["entities"]
+    assert set(seen["threads"]) == {"quest", "important_decision", "unresolved_question"}
+    assert set(seen["meta"]) == {"rule", "follow_up", "table_note"}
+
+
+def test_a_section_returning_the_wrong_kinds_cannot_displace_the_recap() -> None:
+    # Simulates the real response: scenes where a recap was asked for.
+    def wrong_kinds(prompt, model, schema):
+        # Always a scene, whatever the section asked for.
+        return AnalysisResult.model_validate({"proposals": [{
+            "kind": "scene", "title": "Not a recap", "body": "Body.", "aliases": [],
+            "confidence": 0.9, "visibility": "gm", "evidence": [],
+        }]}), {"eval_count": 5}
+
+    session = GameSession(
+        title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
+    candidates = [ExtractedProposal.model_validate({
+        "kind": "scene", "title": f"Scene {i}", "body": "Body.", "aliases": [],
+        "confidence": 0.8, "visibility": "gm",
+        "evidence": [{"segment_ids": [i], "quote": "q"}],
+    }) for i in range(6)]
 
     result, metadata = consolidate_analysis(
-        session, [], [], candidates, fake_analyze, "test-model", 20_000
-    )
+        session, [], [], candidates, wrong_kinds, "m", 20_000)
 
-    summaries = [proposal for proposal in result.proposals if proposal.kind == "session_summary"]
-    assert len(summaries) == 1
-    assert full.strip() in summaries[0].body
-    assert narrow.strip() not in summaries[0].body
-    assert "coverage_retry" in next(
-        item for item in metadata if item["section"] == "narrative"
-    )
+    # A scene returned for the recap section is discarded, and the shortfall is
+    # recorded rather than the run silently completing without a recap.
+    recap_meta = next(m for m in metadata if m["section"] == "recap")
+    assert recap_meta.get("missing_required_section") == "recap"
+    assert not any(p.kind == "session_summary" for p in result.proposals)
 
+
+def test_trimming_never_discards_a_required_kind() -> None:
+    recap = ExtractedProposal.model_validate({
+        "kind": "session_summary", "title": "Session recap", "body": "Recap.",
+        "aliases": [], "confidence": 0.1, "visibility": "player", "evidence": []})
+    filler = [ExtractedProposal.model_validate({
+        "kind": "scene", "title": f"Scene {i}", "body": "Body.", "aliases": [],
+        "confidence": 0.99, "visibility": "player", "evidence": []}) for i in range(60)]
+
+    # The recap has the lowest confidence and arrives first, which under positional
+    # or confidence-only trimming is exactly how it used to be lost.
+    bounded = _bounded_result([recap, *filler])
+
+    assert len(bounded) <= 40
+    assert any(p.kind == "session_summary" for p in bounded)
+
+
+def test_scene_trimming_keeps_the_earliest_scenes_in_order() -> None:
+    section = next(s for s in SECTIONS if s.name == "scenes")
+    scenes = [ExtractedProposal.model_validate({
+        "kind": "scene", "title": f"Scene at {start}", "body": "Body.", "aliases": [],
+        # Later scenes are the most confident, so confidence ordering would drop
+        # the opening of the session.
+        "confidence": 0.5 + index / 100,
+        "visibility": "player",
+        "evidence": [{"segment_ids": [start], "quote": "q"}],
+    }) for index, start in enumerate(range(0, 200, 10))]
+
+    trimmed = _trim_section(scenes, section)
+
+    assert len(trimmed) == section.maximum
+    starts = [p.evidence[0].segment_ids[0] for p in trimmed]
+    assert starts == sorted(starts), "an outline must stay chronological"
+    assert starts[0] == 0, "the opening scene must survive"
 
 def test_character_classification_uses_campaign_guide_and_removes_annotations() -> None:
     creator_id = uuid.uuid4()
