@@ -37,6 +37,8 @@ GM_SPEAKER_LABEL = "GM"
 UNKNOWN_SPEAKER_LABEL = "Unidentified speaker"
 RESERVED_SPEAKER_LABELS = frozenset({GM_SPEAKER_LABEL.casefold(), UNKNOWN_SPEAKER_LABEL.casefold()})
 _RAW_CLUSTER_LABEL = re.compile(r"^\s*speaker[_\s-]*\d+\s*$", re.IGNORECASE)
+# "Speaker C" is a pseudonym for an unreviewed cluster, never a character name.
+_SPEAKER_PSEUDONYM = re.compile(r"^\s*speaker\s+[a-z]{1,3}\s*$", re.IGNORECASE)
 
 
 def narration_speaker(segment: dict[str, Any]) -> str:
@@ -54,9 +56,44 @@ def narration_speaker(segment: dict[str, Any]) -> str:
     if segment.get("speaker_profile_id") or segment.get("speaker_name"):
         # A known human with no character is the GM voicing the world.
         return GM_SPEAKER_LABEL
+    pseudonym = str(segment.get("speaker_pseudonym") or "").strip()
+    if pseudonym:
+        return pseudonym
     if segment.get("speaker"):
         return UNKNOWN_SPEAKER_LABEL
     return ""
+
+
+def assign_speaker_pseudonyms(segments: list[dict[str, Any]]) -> dict[str, str]:
+    """Give each unreviewed cluster a stable, neutral, distinct name.
+
+    Rendering every unreviewed cluster as the same unknown label would tell the
+    model one person spoke the entire session. Distinct pseudonyms keep speaker
+    changes visible without exposing a cluster label or a real name, which
+    matters because a session is analyzable before its speakers are reviewed.
+    """
+    mapping: dict[str, str] = {}
+    for segment in segments:
+        if segment.get("character_name") or segment.get("speaker_profile_id"):
+            continue
+        label = segment.get("speaker")
+        if not label:
+            continue
+        key = str(label)
+        if key not in mapping:
+            mapping[key] = f"Speaker {_pseudonym_suffix(len(mapping))}"
+        segment["speaker_pseudonym"] = mapping[key]
+    return mapping
+
+
+def _pseudonym_suffix(index: int) -> str:
+    """Return A, B, ... Z, AA, AB, ... so any speaker count stays readable."""
+    letters = ""
+    position = index + 1
+    while position:
+        position, remainder = divmod(position - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
 
 
 def is_reserved_speaker_name(value: str) -> bool:
@@ -64,7 +101,11 @@ def is_reserved_speaker_name(value: str) -> bool:
     candidate = value.strip().casefold()
     if not candidate:
         return False
-    return candidate in RESERVED_SPEAKER_LABELS or bool(_RAW_CLUSTER_LABEL.match(candidate))
+    return (
+        candidate in RESERVED_SPEAKER_LABELS
+        or bool(_RAW_CLUSTER_LABEL.match(candidate))
+        or bool(_SPEAKER_PSEUDONYM.match(candidate))
+    )
 
 
 KIND_ALIASES = {
@@ -505,6 +546,8 @@ def process_analysis_job(
         character_name = character_by_speaker.get(str(profile_id)) if profile_id else None
         if character_name:
             segment["character_name"] = character_name
+    # Unreviewed clusters still need to be told apart from one another.
+    assign_speaker_pseudonyms(segments)
     speaker_context = [
         f"{character.canonical_name} is a player character"
         f"{' (primary voice)' if assignment.is_primary else ''}"
@@ -1310,8 +1353,9 @@ Rules:
 - meta: explicit rulings, promised/deferred follow-ups, useful scheduling, attendance, or technical notes.
 - Ignore greetings, food, interruptions, cross-talk, incidental jokes, inconclusive lookup, and transcript noise.
 - Speakers are not automatically their PCs. Mark secrets and uncertain identity GM-only.
-- "{GM_SPEAKER_LABEL}" and "{UNKNOWN_SPEAKER_LABEL}" are transcript roles, never characters. Never make an
-  entity for them, never treat them as an NPC, and never use them in a title.
+- "{GM_SPEAKER_LABEL}", "{UNKNOWN_SPEAKER_LABEL}", and "Speaker A"-style names are transcript roles for
+  voices that are not yet identified. They are never characters: never make an entity for them,
+  never treat one as an NPC, and never use one in a title.
 - Name people only by character name. Do not describe a character in terms of who plays them.
 - Return exactly one JSON object with a "proposals" array and no surrounding commentary.
 - Each proposal contains kind, title, body, aliases, evidence, confidence, visibility.

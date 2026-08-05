@@ -12,6 +12,7 @@ from campaign_manager.analysis import (
     AnalysisResult,
     ExtractedProposal,
     _unsupported_identity_thread,
+    assign_speaker_pseudonyms,
     build_analysis_prompt,
     build_analysis_prompts,
     canonicalize_character_kinds,
@@ -632,15 +633,22 @@ def test_prompt_attributes_lines_to_characters_and_withholds_player_names(tmp_pa
         # A known human with no character is the GM voicing the world.
         {"start": 16.0, "end": 18.0, "speaker": "SPEAKER_01", "speaker_name": "Rob's friend",
          "speaker_profile_id": "p2", "text": "The door creaks open."},
-        # An unreviewed cluster must never surface its raw label.
+        # Unreviewed clusters must never surface their raw label, but must stay
+        # distinguishable from each other.
         {"start": 19.0, "end": 21.0, "speaker": "SPEAKER_02", "text": "Someone laughs."},
+        {"start": 22.0, "end": 24.0, "speaker": "SPEAKER_03", "text": "A different voice."},
+        {"start": 25.0, "end": 27.0, "speaker": "SPEAKER_02", "text": "The first voice again."},
     ]
+    assign_speaker_pseudonyms(segments)
 
     prompt, _ = build_analysis_prompt(session, [], segments, 4_000)
 
     assert "Caelen: I open the door." in prompt
     assert "GM: The door creaks open." in prompt
-    assert "Unidentified speaker: Someone laughs." in prompt
+    # Stable per cluster, and distinct between clusters.
+    assert "Speaker A: Someone laughs." in prompt
+    assert "Speaker B: A different voice." in prompt
+    assert "Speaker A: The first voice again." in prompt
     # Real names and raw cluster labels are the source of player/character mix-ups.
     assert "Rob" not in prompt
     assert "SPEAKER_0" not in prompt
@@ -701,6 +709,7 @@ def test_reserved_speaker_roles_never_become_entities() -> None:
         ("npc", "GM (Host)"),
         ("player_character", "SPEAKER_01 (Kip)"),
         ("npc", "Unidentified speaker"),
+        ("npc", "Speaker B"),
         ("npc", "Brannock the Smith"),
     ]]
 
