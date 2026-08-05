@@ -66,5 +66,34 @@ for _pattern in ("*/bin", "*/lib"):
 '@
 Set-Content -Path (Join-Path $siteDir 'sitecustomize.py') -Value $shim -Encoding ascii
 
-Write-Host "Starting campaign-worker (artifact root: $env:CAMPAIGN_ARTIFACT_ROOT)"
-& (Join-Path $Root 'venv\Scripts\campaign-worker.exe')
+# Unbuffered, or a crash loses whatever the worker was about to say.
+$env:PYTHONUNBUFFERED = '1'
+
+# Not $root: PowerShell variables are case-insensitive, so that would
+# silently overwrite the $Root parameter and break every path below.
+$artifactRoot = $env:CAMPAIGN_ARTIFACT_ROOT
+Write-Host "Starting campaign-worker (artifact root: $artifactRoot)"
+
+# Fail fast and say why. A task that cannot reach the share otherwise starts
+# cleanly and only fails on the first artifact read, long after the cause.
+if ($artifactRoot) {
+    try {
+        $null = Get-ChildItem -LiteralPath $artifactRoot -ErrorAction Stop | Select-Object -First 1
+        Write-Host "Artifact root is readable."
+    } catch {
+        Write-Host "WARNING: artifact root is NOT readable as $env:USERNAME : $($_.Exception.Message)"
+        Write-Host "Jobs needing artifacts will fail until this session can reach the share."
+    }
+}
+
+# Invoked directly rather than through Start-Process: with redirection and no
+# console attached that raises UnauthorizedAccessException.
+#
+# The worker logs to stderr, and under redirection PowerShell wraps a native
+# command's stderr in error records. With Stop that makes the first log line a
+# terminating error, so the worker appeared to exit immediately having said
+# nothing. Both streams are left alone and flow to whatever the caller captures.
+$ErrorActionPreference = 'Continue'
+$exe = Join-Path $Root 'venv\Scripts\campaign-worker.exe'
+& $exe
+Write-Host "campaign-worker exited with code $LASTEXITCODE"

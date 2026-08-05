@@ -104,13 +104,33 @@ writes. A `.pth` file cannot do this: its line is executed in a namespace where 
 comprehension cannot see its own imports.
 
 **Artifact reads fail while the share works by hand.** Check which account the
-task runs as. Interactive logons reach the share; SSH sessions and SYSTEM do not.
+share sees, not which account the task runs as. Windows multiplexes every share on
+a server over one session per user, so if a credential for that server is already
+stored under a different account, the tree connect arrives as *that* account
+regardless of who the task runs as. Samba names it plainly at `log level = 3`:
+
+    create_connection_session_info: user 'tim' (from session setup)
+        not permitted to access this share
+
+Either add that account to the share's `valid users`, or clear the stored
+credential so the task authenticates as itself. Mirroring the account name and
+password between Windows and the file server avoids needing a stored credential at
+all, since a network logon cannot create one anyway.
 
 **The share is unreachable from a session that should have it.** The Windows SMB
 redirector can wedge such that no share on that server is reachable, including
 `IPC$`. `Restart-Service LanmanWorkstation -Force`, and reboot if that is not
 enough. An unreachable artifact root is reported as such rather than as a
 credential error.
+
+**The worker exits immediately having logged nothing.** The worker logs to
+standard error, and PowerShell wraps a native command's stderr in error records
+under redirection; with `$ErrorActionPreference = 'Stop'` the first log line
+becomes a terminating error. Leave the streams alone and let the caller capture
+them.
+
+**Paths suddenly point somewhere absurd.** PowerShell variables are
+case-insensitive, so a local `$root` silently overwrites a `$Root` parameter.
 
 **Nothing is claimed even though jobs are queued.** Heavy jobs are serialized
 across every worker, so a job elsewhere blocks this one until it finishes. That is
