@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from campaign_manager.transcription import (
+    PROMPT_BUDGET_CHARS,
     _contained_path,
     build_hotwords,
     build_initial_prompt,
@@ -142,3 +143,22 @@ def test_unc_artifact_root_is_recognised_and_contained() -> None:
     assert root.drive.startswith("\\\\")
     combined = Path(os.path.normpath(root / "campaign/session/job.wav"))
     assert combined.is_relative_to(Path(os.path.normpath(root)))
+
+
+def test_prompt_and_hotwords_together_fit_whisper_budget() -> None:
+    # Exceeding the decoder's prompt window fails outright with a position
+    # encoding error rather than truncating, and the two share that window.
+    entries = [
+        SimpleNamespace(kind=kind, canonical_name=f"{kind.title()} Name {index:03d}",
+                        aliases=[f"alias{index}a", f"alias{index}b"], notes="notes " * 20)
+        for index in range(60)
+        for kind in ("player_character", "npc", "location", "item")
+    ]
+
+    prompt = build_initial_prompt(entries)
+    hotwords = build_hotwords(entries)
+
+    assert len(prompt) <= PROMPT_BUDGET_CHARS + 80  # plus the fixed header line
+    assert len(hotwords) <= PROMPT_BUDGET_CHARS
+    # Four characters per token is the usual rule of thumb; stay under ~224.
+    assert (len(prompt) + len(hotwords)) / 4 < 224
