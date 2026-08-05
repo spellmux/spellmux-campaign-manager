@@ -19,7 +19,12 @@ from sqlalchemy.orm import Session
 from campaign_manager.comparison import parse_timed_text
 from campaign_manager.compute import probe_ollama, select_analysis_target
 from campaign_manager.config import Settings
-from campaign_manager.diarization import attribute_transcript_segments, cluster_resolutions
+from campaign_manager.diarization import (
+    MUSIC_DISPOSITIONS,
+    UNUSABLE_VOICE_DISPOSITIONS,
+    attribute_transcript_segments,
+    cluster_resolutions,
+)
 from campaign_manager.models import (
     AnalysisProposal,
     Artifact,
@@ -35,7 +40,14 @@ from campaign_manager.review import read_artifact
 
 GM_SPEAKER_LABEL = "GM"
 UNKNOWN_SPEAKER_LABEL = "Unidentified speaker"
-RESERVED_SPEAKER_LABELS = frozenset({GM_SPEAKER_LABEL.casefold(), UNKNOWN_SPEAKER_LABEL.casefold()})
+NON_SPEECH_LABEL = "Non-speech audio"
+# Reviewed clusters that resolve to something other than a person.
+NON_SPEECH_DISPOSITIONS = frozenset(MUSIC_DISPOSITIONS | UNUSABLE_VOICE_DISPOSITIONS)
+RESERVED_SPEAKER_LABELS = frozenset(
+    {GM_SPEAKER_LABEL.casefold(), UNKNOWN_SPEAKER_LABEL.casefold(), NON_SPEECH_LABEL.casefold()}
+    | {name.replace("_", " ").casefold() for name in NON_SPEECH_DISPOSITIONS}
+    | {"needs attention"}
+)
 _RAW_CLUSTER_LABEL = re.compile(r"^\s*speaker[_\s-]*\d+\s*$", re.IGNORECASE)
 # "Speaker C" is a pseudonym for an unreviewed cluster, never a character name.
 _SPEAKER_PSEUDONYM = re.compile(r"^\s*speaker\s+[a-z]{1,3}\s*$", re.IGNORECASE)
@@ -53,9 +65,14 @@ def narration_speaker(segment: dict[str, Any]) -> str:
     character = str(segment.get("character_name") or "").strip()
     if character:
         return character
-    if segment.get("speaker_profile_id") or segment.get("speaker_name"):
-        # A known human with no character is the GM voicing the world.
+    if segment.get("speaker_profile_id"):
+        # A confirmed person with no character is the GM voicing the world.
         return GM_SPEAKER_LABEL
+    disposition = str(segment.get("speaker_disposition") or "").strip().casefold()
+    if disposition in NON_SPEECH_DISPOSITIONS:
+        # Music and crosstalk carry a label but no person. Treating them as a
+        # person put song lyrics and unusable audio in the game master's mouth.
+        return str(segment.get("speaker_name") or "").strip() or NON_SPEECH_LABEL
     pseudonym = str(segment.get("speaker_pseudonym") or "").strip()
     if pseudonym:
         return pseudonym

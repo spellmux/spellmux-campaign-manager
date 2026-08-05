@@ -17,7 +17,9 @@ from campaign_manager.analysis import (
     build_analysis_prompts,
     canonicalize_character_kinds,
     consolidate_analysis,
+    is_reserved_speaker_name,
     merge_chunk_proposals,
+    narration_speaker,
     ollama_analyzer,
     ollama_status,
     parse_analysis_content,
@@ -696,6 +698,26 @@ def test_identity_guards_derive_from_campaign_data_not_hardcoded_names() -> None
         "confidence": 0.5, "visibility": "gm", "evidence": [],
     })
     assert _unsupported_identity_thread(incidental, guide) is False
+
+
+def test_non_speech_clusters_are_not_attributed_to_the_game_master() -> None:
+    # A reviewed music or crosstalk cluster carries a display name but no person.
+    music = {"start": 1.0, "end": 4.0, "speaker": "SPEAKER_05", "speaker_name": "Music",
+             "speaker_disposition": "music", "text": "la la la"}
+    crosstalk = {"start": 5.0, "end": 6.0, "speaker": "SPEAKER_04",
+                 "speaker_name": "Needs attention", "speaker_disposition": "crosstalk",
+                 "text": "indistinct"}
+    gm = {"start": 7.0, "end": 8.0, "speaker": "SPEAKER_00", "speaker_name": "Tim",
+          "speaker_profile_id": "p0", "speaker_disposition": "confirmed",
+          "text": "The door creaks."}
+
+    assert narration_speaker(music) == "Music"
+    assert narration_speaker(crosstalk) == "Needs attention"
+    assert narration_speaker(gm) == "GM"
+    # None of these may become an entity.
+    assert is_reserved_speaker_name("Music") is True
+    assert is_reserved_speaker_name("Needs attention") is True
+    assert is_reserved_speaker_name("Caelen Myrhart") is False
 
 
 def test_reserved_speaker_roles_never_become_entities() -> None:
