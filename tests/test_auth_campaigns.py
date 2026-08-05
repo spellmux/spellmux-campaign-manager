@@ -1,5 +1,6 @@
 import json
 import uuid
+from functools import lru_cache
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -11,6 +12,15 @@ from campaign_manager.database import configure_database, session_factory
 from campaign_manager.models import Artifact, Base, GameSession, Job, ProcessingControl, User
 
 
+TEST_PASSWORD = "correct horse battery staple"
+
+
+@lru_cache(maxsize=1)
+def _test_password_hash() -> str:
+    """Hash the fixed test password once; Argon2 is deliberately slow."""
+    return hash_password(TEST_PASSWORD)
+
+
 def configured_client(tmp_path) -> TestClient:
     engine = configure_database(f"sqlite:///{tmp_path / 'test.db'}")
     Base.metadata.create_all(engine)
@@ -19,7 +29,7 @@ def configured_client(tmp_path) -> TestClient:
             User(
                 email="gm@example.test",
                 display_name="Game Master",
-                password_hash=hash_password("correct horse battery staple"),
+                password_hash=_test_password_hash(),
                 is_instance_admin=True,
             )
         )
@@ -47,7 +57,7 @@ def configured_client(tmp_path) -> TestClient:
 def login(client: TestClient) -> str:
     response = client.post(
         "/api/v1/auth/login",
-        json={"email": "GM@Example.Test", "password": "correct horse battery staple"},
+        json={"email": "GM@Example.Test", "password": TEST_PASSWORD},
     )
     assert response.status_code == 200
     assert response.json()["token_type"] == "bearer"
