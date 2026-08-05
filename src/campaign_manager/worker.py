@@ -10,6 +10,7 @@ from campaign_manager.analysis import process_analysis_job
 from campaign_manager.config import Settings
 from campaign_manager.database import configure_database, session_factory
 from campaign_manager.diarization import process_diarization_job
+from campaign_manager.enrollment import process_enrollment_job
 from campaign_manager.jobs import (
     claim_next_job,
     complete_job,
@@ -30,6 +31,8 @@ def main() -> None:
         supported_job_kinds.add("transcription")
     if settings.diarization_provider == "pyannote":
         supported_job_kinds.add("diarization")
+        # Enrollment needs the same embedding stack as diarization.
+        supported_job_kinds.add("speaker_enrollment")
     if settings.analysis_provider == "ollama":
         supported_job_kinds.add("analysis")
 
@@ -54,6 +57,8 @@ def main() -> None:
                         process_transcription_job(database, settings, job)
                     elif job.kind == "diarization":
                         process_diarization_job(database, settings, job)
+                    elif job.kind == "speaker_enrollment":
+                        process_enrollment_job(database, settings, job)
                     elif job.kind == "analysis":
                         process_analysis_job(database, settings, job)
                     complete_job(database, job)

@@ -9,7 +9,9 @@ from sqlalchemy.orm import Session
 
 from campaign_manager.models import Job, JobStatus, ProcessingControl, utc_now
 
-HEAVY_JOB_KINDS = {"transcription", "diarization", "analysis", "image_generation"}
+HEAVY_JOB_KINDS = {
+    "transcription", "diarization", "analysis", "image_generation", "speaker_enrollment",
+}
 COMPUTE_LANE_CONTROL = "__compute_lane__"
 
 

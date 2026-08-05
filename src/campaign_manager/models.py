@@ -338,6 +338,40 @@ class SpeakerReview(Base):
     speaker_profile: Mapped[SpeakerProfile | None] = relationship()
 
 
+class SpeakerVoiceprint(Base):
+    """A reusable voice centroid for one campaign speaker.
+
+    Diarization cluster labels are session-local, so identity cannot carry across
+    sessions without an enrolled vector. Centroids are built from clips a GM
+    approved as references, which are cleaner than a whole-cluster average that
+    would include the crosstalk they excluded.
+    """
+
+    __tablename__ = "speaker_voiceprints"
+    __table_args__ = (
+        UniqueConstraint(
+            "speaker_profile_id", "embedding_model", name="uq_speaker_voiceprint_model"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    speaker_profile_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("speaker_profiles.id", ondelete="CASCADE"), index=True
+    )
+    # Vectors from different models are not comparable, so each is kept separately.
+    embedding_model: Mapped[str] = mapped_column(String(160))
+    embedding: Mapped[list[float]] = mapped_column(JSON, default=list)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Total approved reference audio behind the centroid; longer is more reliable.
+    sample_seconds: Mapped[float] = mapped_column(default=0.0)
+    source_session_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+    speaker_profile: Mapped[SpeakerProfile] = relationship()
+
+
 class Artifact(Base):
     __tablename__ = "artifacts"
 

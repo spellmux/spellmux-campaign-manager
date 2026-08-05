@@ -571,6 +571,18 @@ class SpeakerCharacterAssignmentResponse(BaseModel):
     created_at: datetime
 
 
+class SpeakerVoiceprintResponse(BaseModel):
+    id: uuid.UUID
+    speaker_profile_id: uuid.UUID
+    speaker_name: str
+    embedding_model: str
+    dimensions: int
+    sample_count: int
+    sample_seconds: float
+    source_session_ids: list[str]
+    updated_at: datetime
+
+
 class SpeakerReviewCreate(BaseModel):
     cluster_label: str = Field(min_length=1, max_length=80)
     start_seconds: int = Field(ge=0)

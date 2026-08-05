@@ -43,6 +43,7 @@ from campaign_manager.models import (
     SpeakerCharacterAssignment,
     SpeakerProfile,
     SpeakerReview,
+    SpeakerVoiceprint,
     User,
 )
 from campaign_manager.permissions import require_campaign_role
@@ -99,6 +100,7 @@ from campaign_manager.schemas import (
     SpeakerProfileUpdate,
     SpeakerReviewCreate,
     SpeakerReviewResponse,
+    SpeakerVoiceprintResponse,
     TextSourceCreate,
     TextSourceUpdate,
     TokenResponse,
@@ -576,6 +578,80 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 .order_by(SpeakerProfile.display_name)
             )
         )
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/voiceprints",
+        response_model=list[SpeakerVoiceprintResponse],
+        tags=["speaker-review"],
+    )
+    def list_speaker_voiceprints(
+        campaign_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[SpeakerVoiceprintResponse]:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        rows = database.execute(
+            select(SpeakerVoiceprint, SpeakerProfile)
+            .join(SpeakerProfile, SpeakerProfile.id == SpeakerVoiceprint.speaker_profile_id)
+            .where(SpeakerProfile.campaign_id == campaign_id)
+            .order_by(SpeakerProfile.display_name)
+        ).all()
+        return [
+            SpeakerVoiceprintResponse(
+                id=voiceprint.id,
+                speaker_profile_id=voiceprint.speaker_profile_id,
+                speaker_name=profile.display_name,
+                embedding_model=voiceprint.embedding_model,
+                dimensions=len(voiceprint.embedding or []),
+                sample_count=voiceprint.sample_count,
+                sample_seconds=voiceprint.sample_seconds,
+                source_session_ids=[str(value) for value in voiceprint.source_session_ids],
+                updated_at=voiceprint.updated_at,
+            )
+            for voiceprint, profile in rows
+        ]
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/voiceprints",
+        response_model=JobResponse,
+        status_code=202,
+        tags=["speaker-review"],
+    )
+    def queue_speaker_enrollment(
+        campaign_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Job:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        approved = database.scalar(
+            select(func.count(SpeakerReview.id))
+            .join(GameSession, GameSession.id == SpeakerReview.session_id)
+            .where(
+                GameSession.campaign_id == campaign_id,
+                SpeakerReview.disposition == "confirmed",
+                SpeakerReview.approved_reference.is_(True),
+            )
+        ) or 0
+        if approved == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Approve at least one clip as a voice reference before enrolling",
+            )
+        active = database.scalar(select(Job.id).where(
+            Job.kind == "speaker_enrollment",
+            Job.status.in_({"queued", "running"}),
+            Job.payload["campaign_id"].as_string() == str(campaign_id),
+        ))
+        if active is not None:
+            raise HTTPException(status_code=409, detail="Speaker enrollment is already queued")
+        job = Job(
+            kind="speaker_enrollment",
+            payload={"campaign_id": str(campaign_id), "requested_by_id": str(user.id)},
+        )
+        database.add(job)
+        database.commit()
+        database.refresh(job)
+        return job
 
     @app.post(
         "/api/v1/campaigns/{campaign_id}/speakers",

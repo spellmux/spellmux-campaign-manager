@@ -27,6 +27,9 @@ class Settings:
     diarization_provider: str = "disabled"
     diarization_model: str = "pyannote/speaker-diarization-community-1"
     diarization_device: str = "cpu"
+    speaker_embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
+    speaker_match_threshold: float = 0.70
+    speaker_match_margin: float = 0.10
     huggingface_token: str | None = None
     analysis_provider: str = "disabled"
     analysis_model: str = "qwen3:4b"
@@ -65,6 +68,12 @@ class Settings:
                 "pyannote/speaker-diarization-community-1",
             ),
             diarization_device=os.getenv("CAMPAIGN_DIARIZATION_DEVICE", "cpu"),
+            speaker_embedding_model=os.getenv(
+                "CAMPAIGN_SPEAKER_EMBEDDING_MODEL",
+                "pyannote/wespeaker-voxceleb-resnet34-LM",
+            ),
+            speaker_match_threshold=_float_environment("CAMPAIGN_SPEAKER_MATCH_THRESHOLD", 0.70),
+            speaker_match_margin=_float_environment("CAMPAIGN_SPEAKER_MATCH_MARGIN", 0.10),
             huggingface_token=os.getenv("CAMPAIGN_HUGGINGFACE_TOKEN") or None,
             analysis_provider=os.getenv("CAMPAIGN_ANALYSIS_PROVIDER", "disabled"),
             analysis_model=os.getenv("CAMPAIGN_ANALYSIS_MODEL", "qwen3:4b"),
@@ -105,6 +114,9 @@ class Settings:
             "diarization_provider": self.diarization_provider,
             "diarization_model": self.diarization_model,
             "diarization_device": self.diarization_device,
+            "speaker_embedding_model": self.speaker_embedding_model,
+            "speaker_match_threshold": self.speaker_match_threshold,
+            "speaker_match_margin": self.speaker_match_margin,
             "huggingface_token_configured": bool(self.huggingface_token),
             "analysis_provider": self.analysis_provider,
             "analysis_model": self.analysis_model,
@@ -118,6 +130,16 @@ class Settings:
             "otterwiki_publishing_configured": self.otterwiki_repository_path is not None,
             "log_level": self.log_level,
         }
+
+
+def _float_environment(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
 
 
 def _integer_environment(name: str, default: int) -> int:
