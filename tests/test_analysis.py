@@ -825,3 +825,43 @@ def test_aliases_belonging_to_another_entity_are_dropped() -> None:
 def test_analysis_status_is_disabled_by_default(tmp_path) -> None:
     status = ollama_status(replace(_settings(tmp_path), analysis_provider="disabled"))
     assert status == {"configured": False, "ready": False, "model": "qwen3:4b", "models": []}
+
+
+def test_a_paragraph_per_entry_recap_merges_into_one_ordered_recap() -> None:
+    # The live model answers the recap section with one entry per paragraph. Each
+    # merges into a single recap, so they must all survive and stay in order.
+    session = GameSession(
+        title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
+    paragraphs = ["The session opened.", "Then combat.", "Then a decision.", "It ended."]
+
+    def paragraphs_per_entry(prompt, model, schema):
+        enum = schema["properties"]["proposals"]["items"]["properties"]["kind"]["enum"]
+        if enum != ["session_summary"]:
+            return AnalysisResult(proposals=[]), {"eval_count": 1}
+        return AnalysisResult.model_validate({"proposals": [{
+            "kind": "session_summary", "title": "Session recap", "body": body,
+            "aliases": [], "confidence": 0.5 + index / 100, "visibility": "player",
+            "evidence": [{"segment_ids": [index * 10], "quote": "q"}],
+        } for index, body in enumerate(paragraphs)]}), {"eval_count": 9}
+
+    candidates = [ExtractedProposal.model_validate({
+        "kind": "scene", "title": f"Scene {i}", "body": "Body.", "aliases": [],
+        "confidence": 0.8, "visibility": "player",
+        "evidence": [{"segment_ids": [i * 10], "quote": "q"}],
+    }) for i in range(6)]
+
+    result, _metadata = consolidate_analysis(
+        session, [], [], candidates, paragraphs_per_entry, "m", 20_000)
+
+    recaps = [p for p in result.proposals if p.kind == "session_summary"]
+    assert [p.body for p in recaps] == paragraphs, "all paragraphs, in narrative order"
+
+    # merge_chunk_proposals keys every session_summary together, so the reviewed
+    # finding is one recap containing each paragraph once.
+    segments = list(enumerate([{"text": "t", "start": float(i), "end": float(i) + 1}
+                               for i in range(80)]))
+    merged = merge_chunk_proposals([(result.proposals, segments)])
+    bodies = [p.body for p, _ev in merged if p.kind == "session_summary"]
+    assert len(bodies) == 1
+    for paragraph in paragraphs:
+        assert paragraph in bodies[0]

@@ -1069,7 +1069,10 @@ SECTIONS: tuple[SectionSpec, ...] = (
             "it across the whole session rather than the opening scene, and cite "
             "evidence from early, middle, and late segments."
         ),
-        maximum=1,
+        # Models tend to answer with one entry per paragraph, which is fine: every
+        # session_summary merges into a single recap, so several entries become one
+        # multi-paragraph recap. Capping this at one would discard most of it.
+        maximum=8,
         required=True,
     ),
     SectionSpec(
@@ -1191,6 +1194,10 @@ def _trim_section(
     """
     if section.maximum is None or len(proposals) <= section.maximum:
         return proposals
+    if section.name == "recap":
+        # Arrival order is narrative order, and these paragraphs are concatenated
+        # into one recap, so reordering by confidence would scramble the prose.
+        return proposals[: section.maximum]
     if section.name == "scenes":
         # Scenes are a chronological outline, so keep the earliest ones in order
         # rather than the most confident ones out of order.
