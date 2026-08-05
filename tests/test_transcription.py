@@ -103,7 +103,12 @@ def test_hotwords_spend_a_tight_budget_on_the_most_spoken_names() -> None:
 def test_absolute_paths_are_refused_without_touching_the_filesystem(tmp_path) -> None:
     # An absolute argument would otherwise replace the root entirely. This must
     # hold before any I/O, so an unreachable root cannot mask a rejection.
-    for escape in ("/etc/passwd", r"C:\Windows\system.ini", r"\\other\share\file"):
+    # Only the running platform's absolute forms qualify: a drive-letter or UNC
+    # path is an ordinary relative filename on POSIX and stays inside the root.
+    escapes = ["/etc/passwd"]
+    if os.name == "nt":
+        escapes += [r"C:\Windows\system.ini", r"\\other\share\file"]
+    for escape in escapes:
         with pytest.raises(ValueError, match="escapes"):
             _contained_path(tmp_path, escape)
 
