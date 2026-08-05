@@ -36,14 +36,22 @@ def build_hotwords(entries: Iterable[CampaignGuideEntry], limit: int = 800) -> s
     accumulated six phonetic spellings in the guide, and an inn was transcribed
     with the wrong name. Hotwords keep the bias active throughout.
     """
+    # Whisper's prompt window is small, so the budget is spent most-spoken first.
+    # Ordering the guide by kind alphabetically put player characters near the end
+    # and truncated them out entirely, which are the names said most often and the
+    # ones that had accumulated the most misspellings.
+    priority = {
+        "player_character": 0, "character": 1, "npc": 2, "location": 3,
+        "faction": 4, "deity": 5, "creature": 6, "monster": 7, "item": 8, "spell": 9,
+    }
+    ordered = sorted(entries, key=lambda entry: (priority.get(entry.kind, 99), entry.canonical_name))
     names: list[str] = []
-    for entry in entries:
-        for candidate in (entry.canonical_name, *entry.aliases):
-            name = str(candidate).strip()
-            # Aliases are often the mishearing itself, so only the canonical
-            # spelling is boosted; single words carry the pronunciation anyway.
-            if name and name not in names and candidate == entry.canonical_name:
-                names.append(name)
+    for entry in ordered:
+        # Aliases are usually the mishearing itself, so boosting them would
+        # reinforce the error; only the canonical spelling is reinforced.
+        name = str(entry.canonical_name).strip()
+        if name and name not in names:
+            names.append(name)
     selected: list[str] = []
     used = 0
     for name in names:

@@ -72,3 +72,27 @@ def test_transcription_passes_hotwords_to_the_adapter(tmp_path) -> None:
     # The adapter receives both the drifting prompt and the persistent hotwords.
     fake_transcribe(tmp_path / "a.wav", "prompt text", "Caelen Myrhart")
     assert captured["hotwords"] == "Caelen Myrhart"
+
+
+def test_hotwords_spend_a_tight_budget_on_the_most_spoken_names() -> None:
+    # Guide order is by kind, which alphabetically puts player_character late.
+    # Padding earlier kinds must not push the player characters out.
+    entries = [
+        SimpleNamespace(kind="item", canonical_name=f"Trinket {index:02d}", aliases=[], notes="")
+        for index in range(40)
+    ] + [
+        SimpleNamespace(kind="location", canonical_name="Escherian Stairs", aliases=[], notes=""),
+        SimpleNamespace(kind="player_character", canonical_name="Caelen Myrhart", aliases=[], notes=""),
+        SimpleNamespace(kind="player_character", canonical_name="Norixius Torrin", aliases=[], notes=""),
+        SimpleNamespace(kind="npc", canonical_name="Mrs Thistle Tew", aliases=[], notes=""),
+    ]
+
+    # Budget fits only the priority names, so the trinkets are what lose out.
+    hotwords = build_hotwords(entries, limit=70)
+
+    assert len(hotwords) <= 70
+    names = [name.strip() for name in hotwords.split(",")]
+    # Player characters first, then NPCs, then locations; trinkets lose out.
+    assert names[:2] == ["Caelen Myrhart", "Norixius Torrin"]
+    assert "Mrs Thistle Tew" in names
+    assert not any(name.startswith("Trinket") for name in names)
