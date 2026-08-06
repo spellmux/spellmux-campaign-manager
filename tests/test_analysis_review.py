@@ -3,7 +3,7 @@ from test_auth_campaigns import configured_client, create_campaign_and_session, 
 
 def create_proposal(client, headers, campaign_id, session_id, **overrides):
     payload = {
-        "kind": "character",
+        "kind": "npc",
         "title": "Caelen",
         "body": "A traveler caught between worlds.",
         "aliases": ["Kalen"],
@@ -55,7 +55,7 @@ def test_proposal_can_be_edited_approved_and_promoted(tmp_path) -> None:
     assert approved.json()["promoted_guide_entry_id"] is not None
 
     guide = client.get(f"/api/v1/campaigns/{campaign_id}/guide", headers=headers).json()
-    assert [(entry["kind"], entry["canonical_name"]) for entry in guide] == [("character", "Caelen")]
+    assert [(entry["kind"], entry["canonical_name"]) for entry in guide] == [("npc", "Caelen")]
     assert guide[0]["notes"] == "An elven traveler caught between worlds."
     assert client.put(
         f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-proposals/{proposal['id']}",
@@ -71,7 +71,7 @@ def test_approval_links_exact_guide_match_without_overwriting_and_summary_stays_
     existing = client.post(
         f"/api/v1/campaigns/{campaign_id}/guide",
         headers=headers,
-        json={"kind": "character", "canonical_name": "Caelen", "aliases": [], "notes": "Curated truth", "visibility": "gm"},
+        json={"kind": "npc", "canonical_name": "Caelen", "aliases": [], "notes": "Curated truth", "visibility": "gm"},
     ).json()
     duplicate = create_proposal(client, headers, campaign_id, session_id).json()
     approved = client.post(

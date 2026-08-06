@@ -130,8 +130,8 @@ KIND_ALIASES = {
     "event": "scene", "scene_event": "scene", "moment": "memorable_moment",
     "summary": "session_summary", "recap": "session_summary",
     "story_thread": "unresolved_question", "question": "unresolved_question",
-    "task": "follow_up", "todo": "follow_up", "rule_question": "rule",
-    "entity": "character",
+    "task": "follow_up", "todo": "follow_up", "rule_question": "rule", "spell": "item",
+    "entity": "npc",
 }
 
 
@@ -239,7 +239,10 @@ class ExtractedEvidence(BaseModel):
 
 class ExtractedProposal(BaseModel):
     kind: Literal[
-        "session_summary", "character", "player_character", "npc", "monster", "location", "item", "spell", "creature",
+        # No "character": it only ever meant "a person, unclassified" and was always
+        # resolved to npc, while leaving ambiguous entries behind in the guide.
+        # No "spell": not worth a dictionary entry of its own.
+        "session_summary", "player_character", "npc", "monster", "location", "item", "creature",
         "quest", "faction", "deity", "rule", "important_decision", "unresolved_question",
         "scene", "memorable_moment", "follow_up", "table_note",
     ]
@@ -840,7 +843,7 @@ def canonicalize_character_kinds(
     player_character_ids: set[uuid.UUID],
 ) -> list[ExtractedProposal]:
     """Resolve ambiguous people to canonical PCs or NPCs and remove title annotations."""
-    entity_kinds = {"player_character", "npc", "monster", "character", "creature"}
+    entity_kinds = {"player_character", "npc", "monster", "creature"}
     normalized = []
     for original in proposals:
         proposal = original.model_copy(deep=True)
@@ -869,10 +872,7 @@ def canonicalize_character_kinds(
                 proposal.kind = "player_character"
             elif match.kind in {"npc", "monster", "creature"}:
                 proposal.kind = match.kind
-            elif proposal.kind == "character":
-                proposal.kind = "npc"
-        elif proposal.kind == "character":
-            proposal.kind = "npc"
+        else:
             proposal.title = re.sub(r"\s*\([^)]*\)\s*$", "", proposal.title).strip()
         normalized.append(proposal)
     return normalized
@@ -1004,7 +1004,7 @@ def _deduplicate_consolidation_candidates(
 ) -> list[ExtractedProposal]:
     """Merge exact entity duplicates and bound material before asking the model to edit it."""
     entity_kinds = {
-        "player_character", "npc", "monster", "location", "item", "spell",
+        "player_character", "npc", "monster", "location", "item",
         "creature", "faction", "deity",
     }
     merged: dict[tuple[str, str], ExtractedProposal] = {}
@@ -1046,7 +1046,7 @@ class SectionSpec:
 
 
 _ENTITY_OUTPUT_KINDS = (
-    "player_character", "npc", "monster", "location", "item", "spell",
+    "player_character", "npc", "monster", "location", "item",
     "creature", "faction", "deity",
 )
 _NARRATIVE_INPUT_KINDS = frozenset({

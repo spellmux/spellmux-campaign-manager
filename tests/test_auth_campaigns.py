@@ -209,7 +209,7 @@ def test_campaign_guide_stores_canonical_vocabulary(tmp_path) -> None:
         f"/api/v1/campaigns/{campaign_id}/guide",
         headers=headers,
         json={
-            "kind": "character",
+            "kind": "npc",
             "canonical_name": "Tasha",
             "aliases": ["Iggwilv", "  Natasha  "],
             "notes": "Use the canonical spelling Tasha.",

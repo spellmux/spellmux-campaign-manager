@@ -294,18 +294,15 @@ class TranscriptRevisionCreate(BaseModel):
 
 GUIDE_KINDS = {
     "instruction",
-    "character",
     "player_character",
     "npc",
     "monster",
     "location",
     "faction",
     "item",
-    "spell",
-    "quest",
     "creature",
     "deity",
-    "rule",
+    # Not entities, but transcription hints the guide carries for whisper.
     "pronunciation",
     "other",
 }
@@ -386,7 +383,7 @@ class CampaignGuideFactResponse(BaseModel):
 
 
 ANALYSIS_KINDS = {
-    "session_summary", "character", "player_character", "npc", "monster", "location", "item", "spell", "creature",
+    "session_summary", "player_character", "npc", "monster", "location", "item", "creature",
     "quest", "faction", "deity", "rule", "important_decision", "unresolved_question",
     "scene", "memorable_moment", "follow_up", "table_note",
 }

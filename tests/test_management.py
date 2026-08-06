@@ -39,12 +39,12 @@ def test_session_guide_speaker_and_text_source_are_manageable(tmp_path) -> None:
     guide = client.post(
         f"/api/v1/campaigns/{campaign_id}/guide",
         headers=headers,
-        json={"kind": "character", "canonical_name": "Kalen", "aliases": [], "notes": "", "visibility": "gm"},
+        json={"kind": "npc", "canonical_name": "Kalen", "aliases": [], "notes": "", "visibility": "gm"},
     ).json()
     edited_guide = client.put(
         f"/api/v1/campaigns/{campaign_id}/guide/{guide['id']}",
         headers=headers,
-        json={"kind": "character", "canonical_name": "Caelen", "aliases": ["Kalen"], "notes": "PC", "visibility": "player"},
+        json={"kind": "npc", "canonical_name": "Caelen", "aliases": ["Kalen"], "notes": "PC", "visibility": "player"},
     )
     speaker = client.post(
         f"/api/v1/campaigns/{campaign_id}/speakers",

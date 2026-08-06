@@ -77,7 +77,7 @@ def test_analysis_job_creates_grounded_review_proposals(tmp_path) -> None:
     ).json()
     client.post(
         f"/api/v1/campaigns/{campaign_id}/guide", headers=headers,
-        json={"kind": "character", "canonical_name": "Caelen", "aliases": ["Kalen"], "notes": "Player character", "visibility": "gm"},
+        json={"kind": "npc", "canonical_name": "Caelen", "aliases": ["Kalen"], "notes": "Player character", "visibility": "gm"},
     )
     queued = client.post(
         f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis",
@@ -88,7 +88,7 @@ def test_analysis_job_creates_grounded_review_proposals(tmp_path) -> None:
     def fake_analyze(prompt, model, schema):
         captured.update(prompt=prompt, model=model, schema=schema)
         return AnalysisResult.model_validate({"proposals": [{
-            "kind": "character", "title": "Caelen", "body": "Opened the door.",
+            "kind": "npc", "title": "Caelen", "body": "Opened the door.",
             "aliases": [], "confidence": 0.9, "visibility": "gm",
             "evidence": [{"segment_ids": [0], "quote": "Caelen opens the door."}],
         }]}), {"eval_count": 42}
@@ -104,7 +104,7 @@ def test_analysis_job_creates_grounded_review_proposals(tmp_path) -> None:
         assert proposal.run_metadata["eval_count"] == 42
         assert job.payload["analysis_progress"]["stage"] == "complete"
         assert job.payload["analysis_progress"]["finding_count"] == 1
-    assert "character: Caelen" in captured["prompt"]
+    assert "npc: Caelen" in captured["prompt"]
     assert "[0 12.00-16.00s]" in captured["prompt"]
 
 
@@ -225,12 +225,12 @@ def test_analysis_prompts_cover_long_source_with_overlap_and_global_ids(tmp_path
 
 def test_chunk_merge_deduplicates_entities_and_preserves_evidence() -> None:
     first = ExtractedProposal.model_validate({
-        "kind": "character", "title": "Caelen", "body": "Opened the door.",
+        "kind": "npc", "title": "Caelen", "body": "Opened the door.",
         "aliases": [], "confidence": 0.8, "visibility": "player",
         "evidence": [{"segment_ids": [4], "quote": "I open the door."}],
     })
     second = ExtractedProposal.model_validate({
-        "kind": "character", "title": "caelen", "body": "Found the key.",
+        "kind": "npc", "title": "caelen", "body": "Found the key.",
         "aliases": ["Kalen"], "confidence": 0.9, "visibility": "gm",
         "evidence": [{"segment_ids": [8], "quote": "The key is here."}],
     })
@@ -659,7 +659,7 @@ def test_character_classification_uses_campaign_guide_and_removes_annotations() 
     campaign_id = uuid.uuid4()
     magnus = CampaignGuideEntry(
         id=uuid.uuid4(),
-        campaign_id=campaign_id, kind="character", canonical_name="Magnus Heartsbane",
+        campaign_id=campaign_id, kind="npc", canonical_name="Magnus Heartsbane",
         aliases=["Magnus Hartspain"], notes="Player character", visibility="player",
         created_by_id=creator_id,
     )
@@ -670,13 +670,13 @@ def test_character_classification_uses_campaign_guide_and_removes_annotations() 
         created_by_id=creator_id,
     )
     proposals = [ExtractedProposal.model_validate({
-        "kind": "character", "title": "Magnus Heartsbane (Michael)", "body": "A bard.",
+        "kind": "npc", "title": "Magnus Heartsbane (Michael)", "body": "A bard.",
         "aliases": [], "confidence": 0.9, "visibility": "player", "evidence": [],
     }), ExtractedProposal.model_validate({
-        "kind": "character", "title": "Mayor Nez (Schlock)", "body": "The mayor.",
+        "kind": "npc", "title": "Mayor Nez (Schlock)", "body": "The mayor.",
         "aliases": [], "confidence": 0.9, "visibility": "gm", "evidence": [],
     }), ExtractedProposal.model_validate({
-        "kind": "character", "title": "Unknown Teenager (Prankster)", "body": "A stranger.",
+        "kind": "npc", "title": "Unknown Teenager (Prankster)", "body": "A stranger.",
         "aliases": [], "confidence": 0.8, "visibility": "gm", "evidence": [],
     })]
 
@@ -807,7 +807,7 @@ def test_reserved_speaker_roles_never_become_entities() -> None:
 def test_aliases_belonging_to_another_entity_are_dropped() -> None:
     campaign_id = uuid.uuid4()
     guide = [
-        _guide_entry("character", "Hollow Empress", ["Empress Nihil"], campaign_id),
+        _guide_entry("npc", "Hollow Empress", ["Empress Nihil"], campaign_id),
         _guide_entry("player_character", "Vess Aldermoor", ["Vess"], campaign_id),
     ]
     proposal = ExtractedProposal.model_validate({

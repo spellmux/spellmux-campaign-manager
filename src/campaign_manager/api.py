@@ -1208,7 +1208,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         proposal = analysis_proposal(database, campaign_id, session_id, proposal_id)
         if proposal.status != "proposed":
             raise HTTPException(status_code=409, detail="Proposal was already reviewed")
-        guide_kinds = {"character", "player_character", "npc", "monster", "location", "item", "spell", "creature", "quest", "faction", "deity", "rule"}
+        # The guide is a dictionary of reusable entities. Quests and rules are
+        # episodic and belong to threads and the table log; spells and the
+        # unclassified "character" bucket were not worth entries of their own.
+        guide_kinds = {
+            "player_character", "npc", "monster", "location", "item",
+            "creature", "faction", "deity",
+        }
         if proposal.kind in guide_kinds:
             entry = database.scalar(select(CampaignGuideEntry).where(
                 CampaignGuideEntry.campaign_id == campaign_id,
@@ -1242,14 +1248,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "session_summary": ("recap", "recap"),
             "scene": ("outline", "scene"),
             "memorable_moment": ("moments", "memorable_moment"),
-            "character": ("entities", "character"),
             "player_character": ("entities", "player_character"),
             "npc": ("entities", "npc"),
             "monster": ("entities", "monster"),
             "creature": ("entities", "creature"),
             "location": ("entities", "location"),
             "item": ("entities", "item"),
-            "spell": ("entities", "spell"),
             "faction": ("entities", "faction"),
             "deity": ("entities", "deity"),
             "important_decision": ("threads", "decision"),
