@@ -1,4 +1,5 @@
 import subprocess
+import uuid
 
 import pytest
 from test_auth_campaigns import configured_client, create_campaign_and_session, login
@@ -69,3 +70,28 @@ def test_otterwiki_adapter_commits_and_protects_existing_pages(tmp_path) -> None
 def test_publish_path_rejects_unsafe_targets(path) -> None:
     with pytest.raises(ValueError):
         validate_target_path(path)
+
+
+def test_every_analysis_kind_is_either_published_or_deliberately_withheld() -> None:
+    # The renderer's section map silently outlived a kind rename once: approved npc
+    # findings stopped appearing on player pages with nothing to show it happened.
+    from campaign_manager.models import AnalysisProposal, GameSession
+    from campaign_manager.publishing import render_player_draft
+    from campaign_manager.schemas import ANALYSIS_KINDS
+
+    # Handled outside the section map, or GM-only table logistics.
+    withheld = {"session_summary", "follow_up", "table_note", "pronunciation", "instruction"}
+    game_session = GameSession(
+        id=uuid.uuid4(), title="Coverage", description="", campaign_id=uuid.uuid4(),
+        created_by_id=uuid.uuid4(),
+    )
+    unpublished = []
+    for kind in sorted(ANALYSIS_KINDS - withheld):
+        draft = render_player_draft(game_session, [AnalysisProposal(
+            session_id=game_session.id, kind=kind, title=f"{kind}-title",
+            body=f"{kind}-body", aliases=[], evidence=[], visibility="player",
+            status="approved", created_by_id=game_session.created_by_id,
+        )])
+        if f"{kind}-title" not in draft:
+            unpublished.append(kind)
+    assert unpublished == []

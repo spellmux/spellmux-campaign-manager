@@ -28,6 +28,7 @@ from campaign_manager.database import database_session
 from campaign_manager.diarization import attribute_transcript_segments, cluster_resolutions
 from campaign_manager.models import (
     AnalysisProposal,
+    AnalysisRun,
     Artifact,
     Campaign,
     CampaignGuideEntry,
@@ -63,6 +64,7 @@ from campaign_manager.schemas import (
     AnalysisProposalResponse,
     AnalysisProposalUpdate,
     AnalysisRunCreate,
+    AnalysisRunResponse,
     ArtifactResponse,
     CampaignCreate,
     CampaignGuideCreate,
@@ -1095,6 +1097,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Analysis proposal not found")
         return proposal
 
+    # Findings from a superseded generation stay in the database for comparison but
+    # must not reach the review queue or any published page. Manually authored
+    # findings have no run and belong to every generation.
+    active_run_findings = (
+        AnalysisProposal.analysis_run_id.is_(None)
+        | (AnalysisProposal.analysis_run_id == GameSession.active_analysis_run_id)
+    )
+
     def chronicle_entry(
         database: Session, campaign_id: uuid.UUID, session_id: uuid.UUID, entry_id: uuid.UUID
     ) -> ChronicleEntry:
@@ -1148,6 +1158,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         entry.body = request.body.strip()
         entry.position = request.position
         entry.visibility = request.visibility
+        # A hand edit makes this entry the campaign's canon, which is what stops a
+        # later analysis run from overwriting it on approval.
+        entry.edited_at = datetime.now(UTC)
         database.commit()
         database.refresh(entry)
         return entry
@@ -1182,7 +1195,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         statement = (
             select(AnalysisProposal)
             .join(GameSession, GameSession.id == AnalysisProposal.session_id)
-            .where(GameSession.campaign_id == campaign_id)
+            .where(GameSession.campaign_id == campaign_id, active_run_findings)
             .order_by(AnalysisProposal.created_at, AnalysisProposal.kind, AnalysisProposal.title)
         )
         if proposal_status is not None:
@@ -1207,7 +1220,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         statement = (
             select(AnalysisProposal)
             .join(GameSession, GameSession.id == AnalysisProposal.session_id)
-            .where(AnalysisProposal.session_id == session_id, GameSession.campaign_id == campaign_id)
+            .where(
+                AnalysisProposal.session_id == session_id,
+                GameSession.campaign_id == campaign_id,
+                active_run_findings,
+            )
             .order_by(AnalysisProposal.created_at, AnalysisProposal.kind, AnalysisProposal.title)
         )
         if proposal_status is not None:
@@ -1268,6 +1285,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         proposal = analysis_proposal(database, campaign_id, session_id, proposal_id)
         if proposal.status != "proposed":
             raise HTTPException(status_code=409, detail="Reviewed proposals cannot be edited")
+        if proposal.analysis_run_id is not None:
+            # What the model produced is the record of what the model produced.
+            # Review is approve or reject; the wording is edited in the Chronicle,
+            # where an edit is marked as canon instead of quietly rewriting history.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Model findings are immutable. Approve or reject it, then edit the "
+                    "Chronicle entry, which becomes the campaign's canon"
+                ),
+            )
         proposal.title = request.title.strip()
         proposal.body = request.body.strip()
         proposal.aliases = list(dict.fromkeys(a.strip() for a in request.aliases if a.strip()))
@@ -1290,6 +1318,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         proposal = analysis_proposal(database, campaign_id, session_id, proposal_id)
         if proposal.status != "proposed":
             raise HTTPException(status_code=409, detail="Proposal was already reviewed")
+        active_run_id = database.scalar(
+            select(GameSession.active_analysis_run_id).where(GameSession.id == session_id)
+        )
+        if proposal.analysis_run_id is not None and proposal.analysis_run_id != active_run_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Finding belongs to a superseded analysis run; activate that run to review it",
+            )
         # The guide is a dictionary of reusable entities. Quests and rules are
         # episodic and belong to threads and the table log; spells and the
         # unclassified "character" bucket were not worth entries of their own.
@@ -1350,6 +1386,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ChronicleEntry.source_proposal_id == proposal.id
             ))
             if existing is None:
+                # Re-analysing a session produces a new finding for the same thing.
+                # Approving it should refresh the Chronicle rather than add a second
+                # entry with the same title, so match on section and title too.
+                existing = database.scalar(select(ChronicleEntry).where(
+                    ChronicleEntry.session_id == session_id,
+                    ChronicleEntry.section == section,
+                    func.lower(ChronicleEntry.title) == proposal.title.casefold(),
+                ))
+            if existing is None:
                 position = database.scalar(select(func.count(ChronicleEntry.id)).where(
                     ChronicleEntry.session_id == session_id, ChronicleEntry.section == section
                 )) or 0
@@ -1360,6 +1405,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     entry_metadata={"aliases": proposal.aliases, "evidence": proposal.evidence},
                     created_by_id=user.id,
                 ))
+            elif existing.edited_at is None:
+                # Untouched machine text is safe to replace with the newer finding.
+                existing.source_proposal_id = proposal.id
+                existing.entry_type = entry_type
+                existing.title = proposal.title
+                existing.body = proposal.body
+                existing.visibility = proposal.visibility
+                existing.entry_metadata = {
+                    "aliases": proposal.aliases, "evidence": proposal.evidence,
+                }
+            # An entry a human has edited is the campaign's canon: a later run never
+            # overwrites it. The finding is still approved, and its lineage stays
+            # readable through the run it came from.
         proposal.status = "approved"
         proposal.reviewed_by_id = user.id
         proposal.reviewed_at = datetime.now(UTC)
@@ -1434,11 +1492,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ))
         if game_session is None:
             raise HTTPException(status_code=404, detail="Session not found")
-        proposals = list(database.scalars(select(AnalysisProposal).where(
-            AnalysisProposal.session_id == session_id,
-            AnalysisProposal.status == "approved",
-            AnalysisProposal.visibility == "player",
-        ).order_by(AnalysisProposal.created_at)))
+        proposals = list(database.scalars(
+            select(AnalysisProposal)
+            .join(GameSession, GameSession.id == AnalysisProposal.session_id)
+            .where(
+                AnalysisProposal.session_id == session_id,
+                AnalysisProposal.status == "approved",
+                AnalysisProposal.visibility == "player",
+                active_run_findings,
+            )
+            .order_by(AnalysisProposal.created_at)
+        ))
         if not proposals:
             raise HTTPException(status_code=409, detail="Approve at least one player-visible finding first")
         target = request.target_path or default_target_path(game_session)
@@ -1852,6 +1916,68 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for kind in ("transcription", "diarization", "analysis", "image_generation")
         ]
         return controls
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-runs",
+        response_model=list[AnalysisRunResponse],
+        tags=["analysis-review"],
+    )
+    def list_analysis_runs(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[AnalysisRunResponse]:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        game_session = database.scalar(select(GameSession).where(
+            GameSession.id == session_id, GameSession.campaign_id == campaign_id
+        ))
+        if game_session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        runs = list(database.scalars(select(AnalysisRun).where(
+            AnalysisRun.session_id == session_id
+        ).order_by(AnalysisRun.created_at.desc())))
+        responses = []
+        for run in runs:
+            response = AnalysisRunResponse.model_validate(run)
+            response.is_active = run.id == game_session.active_analysis_run_id
+            responses.append(response)
+        return responses
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-runs/{run_id}/activate",
+        response_model=AnalysisRunResponse,
+        tags=["analysis-review"],
+    )
+    def activate_analysis_run(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        run_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> AnalysisRunResponse:
+        """Choose which generation of findings the session shows.
+
+        Older generations are kept rather than deleted so a disappointing re-analysis
+        can be undone, but only one at a time is reviewable or publishable.
+        """
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        game_session = database.scalar(select(GameSession).where(
+            GameSession.id == session_id, GameSession.campaign_id == campaign_id
+        ))
+        if game_session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        run = database.scalar(select(AnalysisRun).where(
+            AnalysisRun.id == run_id, AnalysisRun.session_id == session_id
+        ))
+        if run is None:
+            raise HTTPException(status_code=404, detail="Analysis run not found")
+        game_session.active_analysis_run_id = run.id
+        database.commit()
+        database.refresh(run)
+        response = AnalysisRunResponse.model_validate(run)
+        response.is_active = True
+        return response
 
     @app.post(
         "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis",

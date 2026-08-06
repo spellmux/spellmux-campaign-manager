@@ -98,6 +98,8 @@ class SessionResponse(BaseModel):
     description: str
     status: str
     created_at: datetime
+    # Which generation of findings this session is showing.
+    active_analysis_run_id: uuid.UUID | None = None
 
 
 class ChronicleEntryUpdate(BaseModel):
@@ -127,6 +129,9 @@ class ChronicleEntryResponse(ChronicleEntryUpdate):
     created_by_id: uuid.UUID
     created_at: datetime
     updated_at: datetime
+    # Set the first time a human edits the entry. Once set, the entry is canon and
+    # a later analysis run will not overwrite it.
+    edited_at: datetime | None = None
 
 
 class JobResponse(BaseModel):
@@ -501,6 +506,27 @@ class AnalysisProposalResponse(BaseModel):
 
 class AnalysisRunCreate(BaseModel):
     source_artifact_id: uuid.UUID | None = None
+
+
+class AnalysisRunResponse(BaseModel):
+    """One generation of findings for a session."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    session_id: uuid.UUID
+    source_artifact_id: uuid.UUID | None
+    job_id: uuid.UUID | None
+    provider: str
+    model: str
+    status: str
+    finding_count: int
+    notes: str
+    created_at: datetime
+    completed_at: datetime | None
+    # Only the active run's findings reach the review queue, publication drafts,
+    # and anything else downstream.
+    is_active: bool = False
 
 
 class PublicationCreate(BaseModel):

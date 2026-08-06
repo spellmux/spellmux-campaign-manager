@@ -28,6 +28,7 @@ from campaign_manager.diarization import (
 )
 from campaign_manager.models import (
     AnalysisProposal,
+    AnalysisRun,
     Artifact,
     CampaignGuideEntry,
     GameSession,
@@ -36,6 +37,7 @@ from campaign_manager.models import (
     SpeakerProfile,
     SpeakerReview,
     User,
+    utc_now,
 )
 from campaign_manager.review import read_artifact
 
@@ -511,6 +513,42 @@ def ollama_status(settings: Settings, timeout: float = 3) -> dict[str, Any]:
     )}
 
 
+def _analysis_run_for_job(
+    database: Session, game_session: GameSession, source: Artifact, job: Job
+) -> AnalysisRun:
+    """The run this job's findings belong to, created once and reused on resume.
+
+    The id lives in the job payload so a resumed job checkpoints into the same
+    generation instead of starting a third one, which is how re-running analysis
+    used to leave findings from two attempts interleaved in the review queue.
+    """
+    existing_id = job.payload.get("analysis_run_id")
+    if existing_id:
+        run = database.get(AnalysisRun, uuid.UUID(str(existing_id)))
+        if run is not None and run.session_id == game_session.id:
+            run.status = "running"
+            database.commit()
+            return run
+    # A run still marked running when a new one starts was interrupted by a
+    # restart; saying so is more useful than leaving it looking live forever.
+    for stale in database.scalars(select(AnalysisRun).where(
+        AnalysisRun.session_id == game_session.id, AnalysisRun.status == "running"
+    )):
+        stale.status = "interrupted"
+    run = AnalysisRun(
+        session_id=game_session.id,
+        source_artifact_id=source.id,
+        job_id=job.id,
+        provider="ollama",
+        status="running",
+    )
+    database.add(run)
+    database.flush()
+    job.payload = {**job.payload, "analysis_run_id": str(run.id)}
+    database.commit()
+    return run
+
+
 def process_analysis_job(
     database: Session, settings: Settings, job: Job, analyze: Analyze | None = None
 ) -> None:
@@ -526,6 +564,8 @@ def process_analysis_job(
     creator = database.get(User, uuid.UUID(str(creator_id))) if creator_id else None
     if creator is None:
         raise ValueError("Analysis job requester no longer exists")
+
+    run = _analysis_run_for_job(database, game_session, source, job)
 
     guide = list(database.scalars(select(CampaignGuideEntry).where(
         CampaignGuideEntry.campaign_id == game_session.campaign_id,
@@ -590,7 +630,7 @@ def process_analysis_job(
     resume_proposals = []
     if job.payload.get("analysis_progress", {}).get("stage") == "consolidating":
         resume_proposals = checkpoint_analysis_proposals(
-            database, game_session, source, segments, guide, player_character_ids
+            database, game_session, run, segments, guide, player_character_ids
         )
     started = time.monotonic()
     if not resume_proposals:
@@ -617,6 +657,8 @@ def process_analysis_job(
             },
         }
         database.commit()
+    run.model = analysis_settings.analysis_model
+    database.commit()
     analyzer = analyze or ollama_analyzer(analysis_settings)
     extracted_runs: list[tuple[list[ExtractedProposal], list[tuple[int, dict[str, Any]]]]] = []
     response_metadata: list[dict[str, Any]] = []
@@ -663,7 +705,7 @@ def process_analysis_job(
             checkpoint = merge_chunk_proposals(extracted_runs)
             if checkpoint:
                 replace_analysis_proposals(
-                    database, game_session, source, creator, job, checkpoint,
+                    database, game_session, source, creator, job, run, checkpoint,
                     response_metadata, len(prompts), analysis_settings.analysis_model,
                 )
             database.commit()
@@ -673,6 +715,12 @@ def process_analysis_job(
             f" All {len(chunk_failures)} chunk(s) failed; first error: "
             f"{chunk_failures[0]['error']}" if chunk_failures else ""
         )
+        # A run that produced nothing must not become the active generation, or
+        # approving the previous run's findings would stop working after a retry.
+        run.status = "failed"
+        run.completed_at = utc_now()
+        run.notes = f"no findings; {len(chunk_failures)} chunk failure(s)"
+        database.commit()
         raise ValueError(
             "Analysis model returned no findings; the source was not marked complete. "
             "Retry with a smaller source window or a more capable model." + detail
@@ -723,11 +771,22 @@ def process_analysis_job(
             if consolidated_merged:
                 merged = consolidated_merged
                 replace_analysis_proposals(
-                    database, game_session, source, creator, job, merged,
+                    database, game_session, source, creator, job, run, merged,
                     response_metadata, len(prompts), analysis_settings.analysis_model,
                 )
                 database.commit()
 
+    run.status = "succeeded"
+    run.finding_count = len(merged)
+    run.completed_at = utc_now()
+    run.notes = "; ".join(part for part in (
+        f"{len(chunk_failures)} chunk failure(s)" if chunk_failures else "",
+        f"consolidation failed: {consolidation_error}" if consolidation_error else "",
+    ) if part)
+    # The run becomes active only now, at the end. Switching earlier would empty
+    # the review queue for the duration of a re-analysis and leave nothing to
+    # review at all if the run failed.
+    game_session.active_analysis_run_id = run.id
     job.payload = {
         **job.payload,
         "analysis_progress": {
@@ -747,24 +806,31 @@ def replace_analysis_proposals(
     source: Artifact,
     creator: User,
     job: Job,
+    run: AnalysisRun,
     merged: list[tuple[ExtractedProposal, list[dict[str, object]]]],
     response_metadata: list[dict[str, Any]],
     chunk_count: int,
     model: str,
 ) -> None:
-    """Checkpoint the latest merged findings after every successful chunk."""
+    """Checkpoint the latest merged findings after every successful chunk.
+
+    Only this run's own findings are replaced. Keying the delete on the run rather
+    than the source artifact is what lets a re-analysis build a new generation
+    without deleting the generation the GM is still reviewing.
+    """
     replaceable = database.scalars(select(AnalysisProposal).where(
         AnalysisProposal.session_id == game_session.id,
+        AnalysisProposal.analysis_run_id == run.id,
         AnalysisProposal.status == "proposed",
     )).all()
     for proposal in replaceable:
-        if proposal.run_metadata.get("source_artifact_id") == str(source.id):
-            database.delete(proposal)
+        database.delete(proposal)
     for extracted, evidence in merged:
         for item in evidence:
             item["artifact_id"] = str(source.id)
         database.add(AnalysisProposal(
-            session_id=game_session.id, kind=extracted.kind, title=extracted.title.strip(),
+            session_id=game_session.id, analysis_run_id=run.id,
+            kind=extracted.kind, title=extracted.title.strip(),
             body=extracted.body.strip(), lane=extracted.lane,
             aliases=list(dict.fromkeys(a.strip() for a in extracted.aliases if a.strip())),
             evidence=evidence, confidence=extracted.confidence, visibility=extracted.visibility,
@@ -784,7 +850,7 @@ def replace_analysis_proposals(
 def checkpoint_analysis_proposals(
     database: Session,
     game_session: GameSession,
-    source: Artifact,
+    run: AnalysisRun,
     segments: list[dict[str, Any]],
     guide: list[CampaignGuideEntry],
     player_character_ids: set[uuid.UUID],
@@ -792,12 +858,11 @@ def checkpoint_analysis_proposals(
     """Rehydrate grounded checkpoints so a failed editorial pass can resume cheaply."""
     rows = database.scalars(select(AnalysisProposal).where(
         AnalysisProposal.session_id == game_session.id,
+        AnalysisProposal.analysis_run_id == run.id,
         AnalysisProposal.status == "proposed",
     )).all()
     proposals = []
     for row in rows:
-        if row.run_metadata.get("source_artifact_id") != str(source.id):
-            continue
         evidence = []
         for item in row.evidence:
             segment_ids = _segments_for_checkpoint_evidence(item, segments)
