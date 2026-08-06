@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from campaign_manager.artifacts import supersede_previous_artifacts
 from campaign_manager.config import Settings
 from campaign_manager.models import (
     Artifact,
@@ -153,6 +154,22 @@ def process_transcription_job(
             "application/json",
         )
         database.add_all((normalized_artifact, transcript_artifact))
+        database.flush()
+        # A re-transcription replaces the previous result rather than leaving two
+        # live transcripts with nothing to say which one counts.
+        retired = [
+            *supersede_previous_artifacts(
+                database, game_session.id, "normalized_audio", normalized_artifact.id
+            ),
+            *supersede_previous_artifacts(
+                database, game_session.id, "raw_transcript", transcript_artifact.id
+            ),
+        ]
+        if retired:
+            job.payload = {
+                **job.payload,
+                "superseded_artifact_ids": [str(artifact.id) for artifact in retired],
+            }
         game_session.status = SessionStatus.REVIEW.value
         database.commit()
     except Exception:

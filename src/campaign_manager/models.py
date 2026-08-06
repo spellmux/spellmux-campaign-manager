@@ -367,6 +367,12 @@ class SpeakerReview(Base):
     session_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("game_sessions.id", ondelete="CASCADE"), index=True
     )
+    # Which diarization's clusters this review describes. A second diarization
+    # renumbers the clusters, so a review carried over from the previous one can
+    # point at a different person entirely.
+    diarization_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     cluster_label: Mapped[str] = mapped_column(String(80))
     start_seconds: Mapped[int] = mapped_column(Integer)
     end_seconds: Mapped[int] = mapped_column(Integer)
@@ -434,6 +440,12 @@ class Artifact(Base):
     size_bytes: Mapped[int] = mapped_column(BigInteger)
     sha256: Mapped[str] = mapped_column(String(64))
     visibility: Mapped[str] = mapped_column(String(20), default="gm")
+    # Set when a newer generation of the same kind replaces this one. Superseded
+    # artifacts stay on disk and in the row set so a worse re-run can be undone,
+    # but no reader picks them up.
+    superseded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_by_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT")
     )

@@ -575,11 +575,17 @@ def process_analysis_job(
     diarization = database.scalar(select(Artifact).where(
         Artifact.session_id == game_session.id,
         Artifact.kind == "diarization",
+        Artifact.superseded_at.is_(None),
     ).order_by(Artifact.created_at.desc()))
     if diarization is not None and any(segment.get("start") is not None for segment in segments):
         diarization_document = read_artifact(settings, diarization)
+        # Only reviews describing this diarization's clusters. A review from a
+        # superseded generation names a label this run may have given to someone
+        # else, which is how a line ends up attributed to the wrong person.
         reviews = list(database.scalars(select(SpeakerReview).where(
             SpeakerReview.session_id == game_session.id,
+            SpeakerReview.diarization_artifact_id.is_(None)
+            | (SpeakerReview.diarization_artifact_id == diarization.id),
         )))
         segments = attribute_transcript_segments(
             segments,

@@ -1097,6 +1097,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Analysis proposal not found")
         return proposal
 
+    def live_diarization(database: Session, session_id: uuid.UUID) -> Artifact | None:
+        return database.scalar(select(Artifact).where(
+            Artifact.session_id == session_id,
+            Artifact.kind == "diarization",
+            Artifact.superseded_at.is_(None),
+        ).order_by(Artifact.created_at.desc()))
+
+    def reviews_of_diarization(diarization_id: uuid.UUID | None):
+        """Reviews describing this diarization's clusters, plus unattributed ones.
+
+        A review with no diarization recorded predates generational diarization or
+        was entered by hand, so it is kept rather than hidden. One belonging to a
+        superseded generation is dropped: its cluster labels have been renumbered,
+        and reusing them would attribute lines to whoever now holds the label.
+        """
+        if diarization_id is None:
+            return SpeakerReview.diarization_artifact_id.is_(None)
+        return (
+            SpeakerReview.diarization_artifact_id.is_(None)
+            | (SpeakerReview.diarization_artifact_id == diarization_id)
+        )
+
     # Findings from a superseded generation stay in the database for comparison but
     # must not reach the review queue or any published page. Manually authored
     # findings have no run and belong to every generation.
@@ -2000,6 +2022,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 Artifact.session_id == session_id,
                 GameSession.campaign_id == campaign_id,
                 Artifact.kind.in_({"corrected_transcript", "raw_transcript", "source_transcript", "source_notes"}),
+                Artifact.superseded_at.is_(None),
             )
             .order_by(Artifact.created_at.desc())
         ))
@@ -2041,6 +2064,80 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return job
 
     @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/transcription",
+        response_model=JobResponse,
+        status_code=202,
+        tags=["review"],
+    )
+    def queue_transcription(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Job:
+        """Transcribe the session's audio again, replacing the current transcript.
+
+        Transcription used to be reachable only by uploading audio, so improving a
+        transcript after a guide fix meant re-uploading the recording and living with
+        two source copies. The new transcript supersedes the old one when it lands,
+        not when it is queued, so a failed re-run costs nothing.
+        """
+        require_campaign_role(
+            database, user, campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        audio = database.scalar(
+            select(Artifact)
+            .join(GameSession, GameSession.id == Artifact.session_id)
+            .where(
+                Artifact.session_id == session_id,
+                Artifact.kind == "source_audio",
+                Artifact.superseded_at.is_(None),
+                GameSession.campaign_id == campaign_id,
+            )
+            .order_by(Artifact.created_at.desc())
+        )
+        if audio is None:
+            raise HTTPException(
+                status_code=409, detail="Upload session audio before transcribing"
+            )
+        # Diarization and analysis both read the transcript, so replacing it under a
+        # running job would leave that job working from a generation nobody can see.
+        blocking = database.scalar(
+            select(Job.kind).where(
+                Job.session_id == session_id,
+                Job.kind.in_(["transcription", "diarization", "analysis"]),
+                Job.status.in_(["queued", "running"]),
+            )
+        )
+        if blocking is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A {blocking} job for this session is already queued or running",
+            )
+        previous = database.scalar(
+            select(Artifact.id).where(
+                Artifact.session_id == session_id,
+                Artifact.kind == "raw_transcript",
+                Artifact.superseded_at.is_(None),
+            ).order_by(Artifact.created_at.desc())
+        )
+        job = Job(
+            session_id=session_id,
+            artifact_id=audio.id,
+            kind="transcription",
+            status="queued",
+            payload={
+                "artifact_id": str(audio.id),
+                **({"replaces_artifact_id": str(previous)} if previous else {}),
+            },
+        )
+        database.add(job)
+        database.commit()
+        database.refresh(job)
+        return job
+
+    @app.post(
         "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/diarization",
         response_model=JobResponse,
         status_code=202,
@@ -2064,6 +2161,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .where(
                 Artifact.session_id == session_id,
                 Artifact.kind == "normalized_audio",
+                Artifact.superseded_at.is_(None),
                 GameSession.campaign_id == campaign_id,
             )
             .order_by(Artifact.created_at.desc())
@@ -2073,29 +2171,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=409,
                 detail="Transcription must finish before diarization can be queued",
             )
-        existing_artifact = database.scalar(
-            select(Artifact.id).where(
-                Artifact.session_id == session_id,
-                Artifact.kind == "diarization",
-            )
-        )
-        if existing_artifact is not None:
-            raise HTTPException(status_code=409, detail="This session is already diarized")
-        existing_job = database.scalar(
-            select(Job.id).where(
+        # Re-diarizing used to be refused outright once a session had a diarization,
+        # which left a bad clustering permanently in place. It is allowed now: the
+        # result supersedes the previous one when it lands, and reviews stay with the
+        # generation whose clusters they describe.
+        blocking = database.scalar(
+            select(Job.kind).where(
                 Job.session_id == session_id,
-                Job.kind == "diarization",
+                Job.kind.in_(["transcription", "diarization", "analysis"]),
                 Job.status.in_(["queued", "running"]),
             )
         )
-        if existing_job is not None:
-            raise HTTPException(status_code=409, detail="Diarization is already queued")
+        if blocking is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A {blocking} job for this session is already queued or running",
+            )
+        previous = live_diarization(database, session_id)
         job = Job(
             session_id=session_id,
             artifact_id=normalized.id,
             kind="diarization",
             status="queued",
-            payload={"normalized_audio_artifact_id": str(normalized.id)},
+            payload={
+                "normalized_audio_artifact_id": str(normalized.id),
+                **({"replaces_artifact_id": str(previous.id)} if previous else {}),
+            },
         )
         database.add(job)
         database.commit()
@@ -2137,12 +2238,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             campaign_id,
             {CampaignRole.OWNER.value, CampaignRole.GM.value},
         )
+        diarization = live_diarization(database, session_id)
         reviews = database.scalars(
             select(SpeakerReview)
             .join(GameSession, GameSession.id == SpeakerReview.session_id)
             .where(
                 SpeakerReview.session_id == session_id,
                 GameSession.campaign_id == campaign_id,
+                reviews_of_diarization(diarization.id if diarization else None),
             )
             .order_by(SpeakerReview.cluster_label, SpeakerReview.start_seconds)
         ).all()
@@ -2194,8 +2297,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=422,
                 detail="A reference clip must have a confirmed speaker",
             )
+        diarization = live_diarization(database, session_id)
         review = SpeakerReview(
             session_id=session_id,
+            diarization_artifact_id=diarization.id if diarization else None,
             cluster_label=request.cluster_label.strip(),
             start_seconds=request.start_seconds,
             end_seconds=request.end_seconds,
@@ -2318,11 +2423,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             diarization = database.scalar(select(Artifact).where(
                 Artifact.session_id == session_id,
                 Artifact.kind == "diarization",
+                Artifact.superseded_at.is_(None),
             ).order_by(Artifact.created_at.desc()))
             if diarization is not None:
                 diarization_content = read_artifact(resolved, diarization)
                 reviews = list(database.scalars(select(SpeakerReview).where(
                     SpeakerReview.session_id == session_id,
+                    reviews_of_diarization(diarization.id),
                 )))
                 content = dict(content)
                 content["segments"] = attribute_transcript_segments(
@@ -2351,6 +2458,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .where(
                 Artifact.session_id == session_id,
                 Artifact.kind.in_(["raw_transcript", "corrected_transcript"]),
+                Artifact.superseded_at.is_(None),
             )
             .order_by(Artifact.created_at.desc())
         )
@@ -2448,6 +2556,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .where(
                 Artifact.session_id == session_id,
                 Artifact.kind == "normalized_audio",
+                Artifact.superseded_at.is_(None),
                 GameSession.campaign_id == campaign_id,
             )
             .order_by(Artifact.created_at.desc())

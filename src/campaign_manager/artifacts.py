@@ -10,11 +10,37 @@ from pathlib import Path
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
+from sqlalchemy import select
+
 from campaign_manager.config import Settings
-from campaign_manager.models import Artifact, GameSession, Job, SessionStatus, User
+from campaign_manager.models import Artifact, GameSession, Job, SessionStatus, User, utc_now
 
 ALLOWED_AUDIO_EXTENSIONS = {".flac", ".m4a", ".mp3", ".mp4", ".ogg", ".opus", ".wav"}
 CHUNK_SIZE = 1024 * 1024
+# Kinds a session holds one live copy of: re-running the stage replaces the result
+# rather than adding a second one nothing can choose between.
+GENERATIONAL_KINDS = ("raw_transcript", "normalized_audio", "diarization")
+
+
+def supersede_previous_artifacts(
+    database: Session, session_id: uuid.UUID, kind: str, keep_id: uuid.UUID
+) -> list[Artifact]:
+    """Retire earlier artifacts of this kind now that a newer one exists.
+
+    Called when the replacement lands, never when the job is queued: a
+    transcription that fails must leave the previous transcript in place, which is
+    the same reason an analysis run only becomes active once it has findings.
+    """
+    superseded = list(database.scalars(select(Artifact).where(
+        Artifact.session_id == session_id,
+        Artifact.kind == kind,
+        Artifact.id != keep_id,
+        Artifact.superseded_at.is_(None),
+    )))
+    stamp = utc_now()
+    for artifact in superseded:
+        artifact.superseded_at = stamp
+    return superseded
 
 
 def ingest_text(

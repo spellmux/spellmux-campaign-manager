@@ -37,6 +37,22 @@ every finding it produces carries that run's id.
 A run's checkpoints belong to the run. Re-analysis replaces only its own findings, which is what
 lets a new generation build while the GM is still reviewing the previous one.
 
+## Transcripts and diarizations are generations too
+
+`raw_transcript`, `normalized_audio`, and `diarization` are **generational kinds**: a session holds
+one live copy of each, and re-running the stage replaces it.
+
+- `POST .../transcription` re-transcribes the session's existing audio. `POST .../diarization`
+  re-diarizes it. Neither requires re-uploading the recording, and both are refused while a
+  transcription, diarization, or analysis job for that session is queued or running.
+- The old artifact is marked `superseded_at` **when the replacement lands**, not when the job is
+  queued, so a failed re-run leaves the previous result in place. Nothing downstream reads a
+  superseded artifact; it stays on disk and in the API listing so a worse re-run can be undone.
+- Speaker reviews belong to the diarization whose clusters they describe. A second diarization
+  renumbers the clusters, so a review carried over from the previous generation would attribute
+  lines to whoever now holds that label. Retired reviews are kept, not deleted: restoring the earlier
+  diarization restores the review work with it.
+
 ## Extraction passes
 
 Extraction reads the transcript in overlapping chunks of `CAMPAIGN_ANALYSIS_CHUNK_CHARS`

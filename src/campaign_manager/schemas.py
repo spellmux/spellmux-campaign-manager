@@ -266,6 +266,9 @@ class ArtifactResponse(BaseModel):
     sha256: str
     visibility: str
     created_at: datetime
+    # Set when a later run of the same stage replaced this artifact. It is still
+    # listed and still readable; nothing downstream picks it up.
+    superseded_at: datetime | None = None
     job: JobResponse | None = None
 
 

@@ -16,6 +16,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from campaign_manager.artifacts import supersede_previous_artifacts
 from campaign_manager.config import Settings
 from campaign_manager.models import Artifact, GameSession, Job, SpeakerReview
 from campaign_manager.transcription import _contained_path
@@ -227,20 +228,32 @@ def process_diarization_job(
     try:
         temporary.write_bytes(encoded)
         os.replace(temporary, destination)
-        database.add(
-            Artifact(
-                id=uuid.uuid4(),
-                session_id=session_id,
-                kind="diarization",
-                relative_path=relative.as_posix(),
-                original_filename=destination.name,
-                media_type="application/json",
-                size_bytes=len(encoded),
-                sha256=hashlib.sha256(encoded).hexdigest(),
-                visibility="gm",
-                created_by_id=created_by_id,
-            )
+        artifact = Artifact(
+            id=uuid.uuid4(),
+            session_id=session_id,
+            kind="diarization",
+            relative_path=relative.as_posix(),
+            original_filename=destination.name,
+            media_type="application/json",
+            size_bytes=len(encoded),
+            sha256=hashlib.sha256(encoded).hexdigest(),
+            visibility="gm",
+            created_by_id=created_by_id,
         )
+        database.add(artifact)
+        database.flush()
+        # Re-diarizing replaces the previous generation. The reviews attached to it
+        # stay put: they describe that generation's clusters, and this one has
+        # renumbered them, so carrying a review across would point it at whoever
+        # now happens to hold the same label.
+        retired = supersede_previous_artifacts(
+            database, session_id, "diarization", artifact.id
+        )
+        if retired:
+            job.payload = {
+                **job.payload,
+                "superseded_artifact_ids": [str(item.id) for item in retired],
+            }
         database.commit()
     except Exception:
         database.rollback()
