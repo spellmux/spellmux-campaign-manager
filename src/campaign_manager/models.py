@@ -220,6 +220,41 @@ class SpeakerCharacterAssignment(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class AnalysisRun(Base):
+    """One analysis of one transcript, and the findings it produced.
+
+    A session may be transcribed and analyzed more than once. Without an explicit
+    run, generations of findings pile up in the same review queue and downstream
+    readers cannot tell them apart: a player page would render approved findings
+    from every generation at once. Selecting a run selects its transcript too,
+    because the transcript is the run's input.
+    """
+
+    __tablename__ = "analysis_runs"
+    __table_args__ = (Index("ix_analysis_runs_session", "session_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("game_sessions.id", ondelete="CASCADE"), index=True
+    )
+    # The transcript this run read; selecting the run selects this transcript.
+    source_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    provider: Mapped[str] = mapped_column(String(80), default="")
+    model: Mapped[str] = mapped_column(String(120), default="")
+    status: Mapped[str] = mapped_column(String(20), default="running")
+    finding_count: Mapped[int] = mapped_column(Integer, default=0)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class AnalysisProposal(Base):
     """A machine- or human-authored session fact awaiting GM judgment."""
 
@@ -229,6 +264,11 @@ class AnalysisProposal(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     session_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("game_sessions.id", ondelete="CASCADE"), index=True
+    )
+    # Which analysis produced this finding; the review queue and every downstream
+    # reader scope to the session's active run so generations cannot mix.
+    analysis_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("analysis_runs.id", ondelete="CASCADE"), nullable=True, index=True
     )
     kind: Mapped[str] = mapped_column(String(40))
     lane: Mapped[str] = mapped_column(String(20), default="story")
@@ -281,6 +321,9 @@ class ChronicleEntry(Base):
     position: Mapped[int] = mapped_column(Integer, default=0)
     visibility: Mapped[str] = mapped_column(String(20), default="gm")
     entry_metadata: Mapped[dict[str, object]] = mapped_column("metadata", JSON, default=dict)
+    # Set when a human edits the entry. Approving a later generation's equivalent
+    # finding must not silently overwrite hand-written canon.
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT")
     )
@@ -301,6 +344,11 @@ class GameSession(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     session_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     status: Mapped[str] = mapped_column(String(30), default=SessionStatus.CREATED.value)
+    # The analysis generation currently in use. Switching it switches which
+    # findings are reviewable and which feed publication drafts.
+    active_analysis_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("analysis_runs.id", ondelete="SET NULL"), nullable=True
+    )
     created_by_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT")
     )
