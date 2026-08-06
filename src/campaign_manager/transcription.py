@@ -27,6 +27,9 @@ from campaign_manager.models import (
 
 # hotwords is optional so an adapter that ignores it keeps working.
 Transcribe = Callable[..., dict[str, Any]]
+# Normalization shells out to ffmpeg, which is deliberately absent from the test
+# image; injecting it lets the job's artifact bookkeeping be tested without it.
+Normalize = Callable[[Path, Path], None]
 
 # Whisper's decoder reserves about 224 tokens for the prompt, and the initial
 # prompt and hotwords share it. Roughly four characters per token, halved so
@@ -90,6 +93,7 @@ def process_transcription_job(
     settings: Settings,
     job: Job,
     transcribe: Transcribe | None = None,
+    normalize: Normalize | None = None,
 ) -> None:
     if job.artifact_id is None or job.session_id is None:
         raise ValueError("Transcription job requires an artifact and session")
@@ -126,7 +130,7 @@ def process_transcription_job(
     database.commit()
     created_paths: list[Path] = []
     try:
-        _normalize_audio(source_path, normalized_path)
+        (normalize or _normalize_audio)(source_path, normalized_path)
         created_paths.append(normalized_path)
         result = (transcribe or _faster_whisper_transcriber(settings))(
             normalized_path, prompt, hotwords

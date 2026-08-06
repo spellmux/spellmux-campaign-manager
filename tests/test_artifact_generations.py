@@ -56,10 +56,28 @@ def _silent_wav() -> bytes:
     return buffer.getvalue()
 
 
-def run_job(job_id, settings, worker, adapter):
+def copy_instead_of_ffmpeg(source, destination) -> None:
+    """Stand in for ffmpeg, which the test image does not carry.
+
+    The uploaded fixture is already 16 kHz mono PCM, so a copy is a faithful
+    normalization and the rest of the job runs for real.
+    """
+    destination.write_bytes(source.read_bytes())
+
+
+def run_transcription(job_id, settings, transcribe):
     with session_factory()() as database:
         job = database.get(Job, uuid.UUID(str(job_id)))
-        worker(database, settings, job, adapter)
+        process_transcription_job(
+            database, settings, job, transcribe, normalize=copy_instead_of_ffmpeg
+        )
+        complete_job(database, job)
+
+
+def run_diarization(job_id, settings, diarize):
+    with session_factory()() as database:
+        job = database.get(Job, uuid.UUID(str(job_id)))
+        process_diarization_job(database, settings, job, diarize)
         complete_job(database, job)
 
 
@@ -68,9 +86,8 @@ def test_re_transcription_supersedes_the_previous_transcript(tmp_path) -> None:
     headers = {"Authorization": f"Bearer {login(client)}"}
     settings = _settings(tmp_path)
     campaign_id, session_id, uploaded = uploaded_session(client, headers)
-    run_job(
-        uploaded["job"]["id"], settings, process_transcription_job,
-        transcriber("Caelen opens the door."),
+    run_transcription(
+        uploaded["job"]["id"], settings, transcriber("Caelen opens the door.")
     )
 
     requeued = client.post(
@@ -82,9 +99,8 @@ def test_re_transcription_supersedes_the_previous_transcript(tmp_path) -> None:
         job = database.get(Job, uuid.UUID(requeued.json()["id"]))
         assert str(job.artifact_id) == uploaded["id"]
         assert "replaces_artifact_id" in job.payload
-    run_job(
-        requeued.json()["id"], settings, process_transcription_job,
-        transcriber("Caelen picks the lock."),
+    run_transcription(
+        requeued.json()["id"], settings, transcriber("Caelen picks the lock.")
     )
 
     artifacts = client.get(
@@ -122,15 +138,14 @@ def test_re_diarization_replaces_clusters_and_retires_their_reviews(tmp_path) ->
     headers = {"Authorization": f"Bearer {login(client)}"}
     settings = _settings(tmp_path)
     campaign_id, session_id, uploaded = uploaded_session(client, headers)
-    run_job(
-        uploaded["job"]["id"], settings, process_transcription_job,
-        transcriber("Caelen opens the door."),
+    run_transcription(
+        uploaded["job"]["id"], settings, transcriber("Caelen opens the door.")
     )
 
     first = client.post(
         f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/diarization", headers=headers
     ).json()
-    run_job(first["id"], settings, process_diarization_job, diarizer(("SPEAKER_00", "SPEAKER_01")))
+    run_diarization(first["id"], settings, diarizer(("SPEAKER_00", "SPEAKER_01")))
 
     speaker = client.post(
         f"/api/v1/campaigns/{campaign_id}/speakers", headers=headers,
@@ -154,10 +169,7 @@ def test_re_diarization_replaces_clusters_and_retires_their_reviews(tmp_path) ->
     with session_factory()() as database:
         job = database.get(Job, uuid.UUID(second.json()["id"]))
         assert "replaces_artifact_id" in job.payload
-    run_job(
-        second.json()["id"], settings, process_diarization_job,
-        diarizer(("SPEAKER_00", "SPEAKER_01")),
-    )
+    run_diarization(second.json()["id"], settings, diarizer(("SPEAKER_00", "SPEAKER_01")))
 
     artifacts = client.get(
         f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/artifacts", headers=headers
@@ -186,17 +198,13 @@ def test_reviews_of_the_live_diarization_still_reach_analysis(tmp_path) -> None:
     headers = {"Authorization": f"Bearer {login(client)}"}
     settings = _settings(tmp_path)
     campaign_id, session_id, uploaded = uploaded_session(client, headers)
-    run_job(
-        uploaded["job"]["id"], settings, process_transcription_job,
-        transcriber("Caelen opens the door."),
+    run_transcription(
+        uploaded["job"]["id"], settings, transcriber("Caelen opens the door.")
     )
     diarization = client.post(
         f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/diarization", headers=headers
     ).json()
-    run_job(
-        diarization["id"], settings, process_diarization_job,
-        diarizer(("SPEAKER_00", "SPEAKER_01")),
-    )
+    run_diarization(diarization["id"], settings, diarizer(("SPEAKER_00", "SPEAKER_01")))
     speaker = client.post(
         f"/api/v1/campaigns/{campaign_id}/speakers", headers=headers,
         json={"display_name": "Rob", "notes": ""},
