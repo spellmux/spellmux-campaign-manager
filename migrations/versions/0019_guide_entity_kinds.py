@@ -73,6 +73,61 @@ def upgrade() -> None:
         "WHERE kind = 'character'"
     ))
 
+    # A named individual is an npc whatever its species; a creature entry is a
+    # type, which is what D&D calls a monster. So a creature sharing a name with
+    # an npc is the same individual filed twice: "The White Rabbit" is a person,
+    # while "Mock Turtle" is a type and stays a creature.
+    op.execute(sa.text("""
+        UPDATE campaign_guide_entries AS npc
+        SET aliases = (
+                SELECT COALESCE(jsonb_agg(DISTINCT value)::json, '[]'::json)
+                FROM (
+                    SELECT jsonb_array_elements_text(npc.aliases::jsonb) AS value
+                    UNION
+                    SELECT jsonb_array_elements_text(cr.aliases::jsonb) AS value
+                ) AS merged
+            ),
+            notes = CASE
+                WHEN length(cr.notes) > length(npc.notes) THEN cr.notes ELSE npc.notes
+            END,
+            updated_at = now()
+        FROM campaign_guide_entries AS cr
+        WHERE cr.kind = 'creature' AND npc.kind = 'npc'
+          AND npc.campaign_id = cr.campaign_id
+          AND lower(npc.canonical_name) = lower(cr.canonical_name)
+    """))
+    op.execute(sa.text("""
+        UPDATE campaign_guide_facts f SET guide_entry_id = npc.id
+        FROM campaign_guide_entries cr, campaign_guide_entries npc
+        WHERE f.guide_entry_id = cr.id
+          AND cr.kind = 'creature' AND npc.kind = 'npc'
+          AND npc.campaign_id = cr.campaign_id
+          AND lower(npc.canonical_name) = lower(cr.canonical_name)
+    """))
+    op.execute(sa.text("""
+        UPDATE speaker_character_assignments a SET guide_entry_id = npc.id
+        FROM campaign_guide_entries cr, campaign_guide_entries npc
+        WHERE a.guide_entry_id = cr.id
+          AND cr.kind = 'creature' AND npc.kind = 'npc'
+          AND npc.campaign_id = cr.campaign_id
+          AND lower(npc.canonical_name) = lower(cr.canonical_name)
+    """))
+    op.execute(sa.text("""
+        DELETE FROM campaign_guide_entries cr
+        WHERE cr.kind = 'creature'
+          AND EXISTS (
+              SELECT 1 FROM campaign_guide_entries npc
+              WHERE npc.kind = 'npc' AND npc.campaign_id = cr.campaign_id
+                AND lower(npc.canonical_name) = lower(cr.canonical_name)
+          )
+    """))
+
+    # "monster" was "creature" under another name.
+    op.execute(sa.text(
+        "UPDATE campaign_guide_entries SET kind = 'creature', updated_at = now() "
+        "WHERE kind = 'monster'"
+    ))
+
     # Spells are not worth a dictionary entry; their facts go with them.
     op.execute(sa.text(
         "DELETE FROM campaign_guide_facts WHERE guide_entry_id IN "

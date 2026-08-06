@@ -46,8 +46,8 @@ def build_hotwords(entries: Iterable[CampaignGuideEntry], limit: int = PROMPT_BU
     # and truncated them out entirely, which are the names said most often and the
     # ones that had accumulated the most misspellings.
     priority = {
-        "player_character": 0, "character": 1, "npc": 2, "location": 3,
-        "faction": 4, "deity": 5, "creature": 6, "monster": 7, "item": 8, "spell": 9,
+        "player_character": 0, "npc": 1, "location": 2,
+        "faction": 3, "deity": 4, "creature": 5, "item": 6,
     }
     ordered = sorted(entries, key=lambda entry: (priority.get(entry.kind, 99), entry.canonical_name))
     names: list[str] = []

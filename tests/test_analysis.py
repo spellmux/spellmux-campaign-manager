@@ -186,7 +186,9 @@ def _settings(tmp_path):
 
 
 def test_prompt_respects_input_limit(tmp_path) -> None:
-    max_chars = 2_000
+    # Comfortably above the fixed rules prefix so this exercises source truncation
+    # rather than failing outright when the rules text grows.
+    max_chars = 3_000
     session = GameSession(title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
     guide = [CampaignGuideEntry(
         campaign_id=session.campaign_id, kind="location", canonical_name="Wonderland",
@@ -718,7 +720,9 @@ def test_prompt_attributes_lines_to_characters_and_withholds_player_names(tmp_pa
     assert "Rob" not in prompt
     assert "SPEAKER_0" not in prompt
     assert 'Return exactly one JSON object with a "proposals" array' in prompt
-    assert "session_summary, player_character, npc, monster" in prompt
+    assert "kinds: session_summary, player_character, npc," in prompt
+    # A named individual is an npc; only a type of creature is a creature.
+    assert '"Bob the Mock Turtle" is an npc, "Mock Turtle" is a creature' in prompt
 
 
 def _guide_entry(kind: str, name: str, aliases: list[str], campaign_id: uuid.UUID):

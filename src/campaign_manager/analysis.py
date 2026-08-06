@@ -130,7 +130,7 @@ KIND_ALIASES = {
     "event": "scene", "scene_event": "scene", "moment": "memorable_moment",
     "summary": "session_summary", "recap": "session_summary",
     "story_thread": "unresolved_question", "question": "unresolved_question",
-    "task": "follow_up", "todo": "follow_up", "rule_question": "rule", "spell": "item",
+    "task": "follow_up", "todo": "follow_up", "rule_question": "rule", "spell": "item", "monster": "creature",
     "entity": "npc",
 }
 
@@ -239,10 +239,12 @@ class ExtractedEvidence(BaseModel):
 
 class ExtractedProposal(BaseModel):
     kind: Literal[
+        # A named individual is an npc, whatever its species; a creature is a type,
+        # which is what D&D calls a monster, so "monster" was the same kind twice.
         # No "character": it only ever meant "a person, unclassified" and was always
         # resolved to npc, while leaving ambiguous entries behind in the guide.
         # No "spell": not worth a dictionary entry of its own.
-        "session_summary", "player_character", "npc", "monster", "location", "item", "creature",
+        "session_summary", "player_character", "npc", "location", "item", "creature",
         "quest", "faction", "deity", "rule", "important_decision", "unresolved_question",
         "scene", "memorable_moment", "follow_up", "table_note",
     ]
@@ -843,7 +845,7 @@ def canonicalize_character_kinds(
     player_character_ids: set[uuid.UUID],
 ) -> list[ExtractedProposal]:
     """Resolve ambiguous people to canonical PCs or NPCs and remove title annotations."""
-    entity_kinds = {"player_character", "npc", "monster", "creature"}
+    entity_kinds = {"player_character", "npc", "creature"}
     normalized = []
     for original in proposals:
         proposal = original.model_copy(deep=True)
@@ -870,7 +872,7 @@ def canonicalize_character_kinds(
             proposal.title = match.canonical_name
             if match.id in player_character_ids or match.kind == "player_character":
                 proposal.kind = "player_character"
-            elif match.kind in {"npc", "monster", "creature"}:
+            elif match.kind in {"npc", "creature"}:
                 proposal.kind = match.kind
         else:
             proposal.title = re.sub(r"\s*\([^)]*\)\s*$", "", proposal.title).strip()
@@ -1004,8 +1006,7 @@ def _deduplicate_consolidation_candidates(
 ) -> list[ExtractedProposal]:
     """Merge exact entity duplicates and bound material before asking the model to edit it."""
     entity_kinds = {
-        "player_character", "npc", "monster", "location", "item",
-        "creature", "faction", "deity",
+        "player_character", "npc", "location", "item", "creature", "faction", "deity",
     }
     merged: dict[tuple[str, str], ExtractedProposal] = {}
     ordered: list[ExtractedProposal] = []
@@ -1046,8 +1047,7 @@ class SectionSpec:
 
 
 _ENTITY_OUTPUT_KINDS = (
-    "player_character", "npc", "monster", "location", "item",
-    "creature", "faction", "deity",
+    "player_character", "npc", "location", "item", "creature", "faction", "deity",
 )
 _NARRATIVE_INPUT_KINDS = frozenset({
     "scene", "memorable_moment", "important_decision", "quest",
@@ -1095,7 +1095,9 @@ SECTIONS: tuple[SectionSpec, ...] = (
         instruction=(
             "Return canonical reusable entity updates only. Merge duplicates, use "
             "canonical-name-only titles, and keep each body under 100 words. An action "
-            "or reaction is not an entity."
+            "or reaction is not an entity. Write each body as a reference entry: what "
+            "this entity is, and what the party learned about it this session. Do not "
+            "state which session it was; that is recorded separately."
         ),
         maximum=14,
     ),
@@ -1390,9 +1392,11 @@ Required editorial behavior:
 - Produce 6-10 chronological scene entries on a final pass, each no more than 90 words. Each scene summarizes what happened and
   the important PC choices or consequences. Do not create a separate entity for each action.
 - Include up to 4 genuinely memorable_moment entries when warranted, each no more than 60 words.
-- Entity kinds are reusable campaign records: player_character, npc, monster, location, item, spell,
-  creature, faction, deity. Their title must be only the canonical entity name. Combine all session
+- Entity kinds are reusable campaign records: player_character, npc, location, item, creature,
+  faction, deity. Their title must be only the canonical entity name. Combine all session
   discoveries or developments for that entity into its body, using no more than 100 words.
+- A named individual is an npc whatever its species. Use creature only for a kind of creature:
+  "Bob the Mock Turtle" is an npc, "Mock Turtle" is a creature.
 - A speaker/player is not their PC. Attribute an action to a PC only when the mapping or source supports it.
 - Use quest for actionable objectives and unresolved_question only for genuine in-fiction mysteries or
   open story threads.
@@ -1404,8 +1408,8 @@ Required editorial behavior:
 - Prefer fewer strong entries. Confidence is evidentiary support, not importance.
 - Keep meta entries under 80 words. Omit low-value candidates to stay inside the requested count and limits.
 - Every proposal contains kind, title, body, aliases, evidence, confidence, visibility.
-- kind is one of session_summary, scene, memorable_moment, player_character, npc, monster,
-  location, item, spell, creature, quest, faction, deity, rule, important_decision,
+- kind is one of session_summary, scene, memorable_moment, player_character, npc,
+  location, item, creature, quest, faction, deity, rule, important_decision,
   unresolved_question, follow_up, table_note.
 - visibility is gm or player. Secrets, enemy plans, and uncertain identities remain gm.
 
@@ -1457,8 +1461,10 @@ Rules:
 - Name people only by character name. Do not describe a character in terms of who plays them.
 - Return exactly one JSON object with a "proposals" array and no surrounding commentary.
 - Each proposal contains kind, title, body, aliases, evidence, confidence, visibility.
-- kinds: session_summary, player_character, npc, monster, location, item, spell, creature, quest,
+- kinds: session_summary, player_character, npc, location, item, creature, quest,
   faction, deity, rule, important_decision, unresolved_question, scene, memorable_moment, follow_up, table_note.
+- A named individual is an npc whatever its species. Use creature only for a kind of creature:
+  "Bob the Mock Turtle" is an npc, "Mock Turtle" is a creature.
 - Evidence has 1-3 bracketed segment_ids plus a short exact quote. confidence is 0-1; visibility is gm or player.
 
 Source segments:

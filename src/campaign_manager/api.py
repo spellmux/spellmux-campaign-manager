@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, st
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import case, func, select, text
+from sqlalchemy import Text, case, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -78,6 +78,7 @@ from campaign_manager.schemas import (
     ComputeWorkerResponse,
     ComputeWorkerTestResponse,
     ComputeWorkerUpdate,
+    GuideSessionReference,
     JobPriorityUpdate,
     JobResponse,
     LoginRequest,
@@ -393,6 +394,70 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.refresh(campaign)
         return _campaign_response(campaign, membership.role)
 
+    def guide_session_references(
+        database: Session, campaign_id: uuid.UUID, players_only: bool
+    ) -> dict[uuid.UUID, list[GuideSessionReference]]:
+        """Which sessions each guide entity was encountered in.
+
+        Derived from the facts approvals leave behind rather than stored on the
+        entry, so it cannot fall out of step with the findings that produced it.
+        Aggregated for the whole campaign in one query: doing it per entry made
+        the guide N+1 queries deep on a campaign with hundreds of entities.
+        """
+        statement = (
+            select(
+                CampaignGuideFact.guide_entry_id,
+                GameSession.id,
+                GameSession.title,
+                GameSession.session_date,
+                func.count(CampaignGuideFact.id),
+            )
+            .join(GameSession, GameSession.id == CampaignGuideFact.session_id)
+            .join(
+                CampaignGuideEntry,
+                CampaignGuideEntry.id == CampaignGuideFact.guide_entry_id,
+            )
+            .where(CampaignGuideEntry.campaign_id == campaign_id)
+            .group_by(
+                CampaignGuideFact.guide_entry_id,
+                GameSession.id,
+                GameSession.title,
+                GameSession.session_date,
+            )
+            # Undated sessions sort last rather than first, where a NULL would put
+            # them, because an unscheduled session is not the earliest encounter.
+            .order_by(
+                CampaignGuideFact.guide_entry_id,
+                GameSession.session_date.is_(None),
+                GameSession.session_date,
+                GameSession.title,
+            )
+        )
+        if players_only:
+            statement = statement.where(
+                CampaignGuideFact.visibility == "player",
+                CampaignGuideFact.status == "canonical",
+            )
+        references: dict[uuid.UUID, list[GuideSessionReference]] = {}
+        for entry_id, session_id, title, session_date, fact_count in database.execute(statement):
+            references.setdefault(entry_id, []).append(
+                GuideSessionReference(
+                    session_id=session_id,
+                    title=title,
+                    session_date=session_date,
+                    fact_count=fact_count,
+                )
+            )
+        return references
+
+    def guide_entry_response(
+        entry: CampaignGuideEntry, sessions: list[GuideSessionReference]
+    ) -> CampaignGuideResponse:
+        response = CampaignGuideResponse.model_validate(entry)
+        response.sessions = sessions
+        response.fact_count = sum(reference.fact_count for reference in sessions)
+        return response
+
     @app.get(
         "/api/v1/campaigns/{campaign_id}/guide",
         response_model=list[CampaignGuideResponse],
@@ -400,21 +465,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def list_campaign_guide(
         campaign_id: uuid.UUID,
+        kind: str | None = Query(default=None),
+        search: str | None = Query(default=None),
         user: User = Depends(current_user),
         database: Session = Depends(database_session),
-    ) -> list[CampaignGuideEntry]:
+    ) -> list[CampaignGuideResponse]:
         membership = require_campaign_role(database, user, campaign_id)
         statement = select(CampaignGuideEntry).where(
             CampaignGuideEntry.campaign_id == campaign_id,
             CampaignGuideEntry.is_active.is_(True),
         )
-        if membership.role == CampaignRole.PLAYER.value:
+        players_only = membership.role == CampaignRole.PLAYER.value
+        if players_only:
             statement = statement.where(CampaignGuideEntry.visibility == "player")
-        return list(
+        if kind:
+            statement = statement.where(CampaignGuideEntry.kind == kind.strip().casefold())
+        if search and search.strip():
+            # Aliases are where a mishearing usually lives, so a name search that
+            # ignored them would miss the entry the GM is looking for.
+            needle = f"%{search.strip().casefold()}%"
+            statement = statement.where(
+                func.lower(CampaignGuideEntry.canonical_name).like(needle)
+                | func.lower(func.cast(CampaignGuideEntry.aliases, Text)).like(needle)
+                | func.lower(CampaignGuideEntry.notes).like(needle)
+            )
+        entries = list(
             database.scalars(
                 statement.order_by(CampaignGuideEntry.kind, CampaignGuideEntry.canonical_name)
             )
         )
+        references = guide_session_references(database, campaign_id, players_only)
+        return [guide_entry_response(entry, references.get(entry.id, [])) for entry in entries]
 
     @app.post(
         "/api/v1/campaigns/{campaign_id}/guide",
@@ -466,7 +547,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: CampaignGuideUpdate,
         user: User = Depends(current_user),
         database: Session = Depends(database_session),
-    ) -> CampaignGuideEntry:
+    ) -> CampaignGuideResponse:
         require_campaign_role(database, user, campaign_id, {"owner", "gm"})
         entry = database.scalar(select(CampaignGuideEntry).where(
             CampaignGuideEntry.id == entry_id,
@@ -485,7 +566,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             database.rollback()
             raise HTTPException(status_code=409, detail="Campaign Guide name already exists") from exc
         database.refresh(entry)
-        return entry
+        references = guide_session_references(database, campaign_id, players_only=False)
+        return guide_entry_response(entry, references.get(entry.id, []))
 
     @app.delete("/api/v1/campaigns/{campaign_id}/guide/{entry_id}", status_code=204)
     def delete_campaign_guide_entry(
@@ -1212,8 +1294,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # episodic and belong to threads and the table log; spells and the
         # unclassified "character" bucket were not worth entries of their own.
         guide_kinds = {
-            "player_character", "npc", "monster", "location", "item",
-            "creature", "faction", "deity",
+            "player_character", "npc", "location", "item", "creature", "faction", "deity",
         }
         if proposal.kind in guide_kinds:
             entry = database.scalar(select(CampaignGuideEntry).where(
@@ -1250,7 +1331,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "memorable_moment": ("moments", "memorable_moment"),
             "player_character": ("entities", "player_character"),
             "npc": ("entities", "npc"),
-            "monster": ("entities", "monster"),
             "creature": ("entities", "creature"),
             "location": ("entities", "location"),
             "item": ("entities", "item"),

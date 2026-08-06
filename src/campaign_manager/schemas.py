@@ -296,7 +296,6 @@ GUIDE_KINDS = {
     "instruction",
     "player_character",
     "npc",
-    "monster",
     "location",
     "faction",
     "item",
@@ -341,6 +340,15 @@ class CampaignGuideUpdate(CampaignGuideCreate):
     pass
 
 
+class GuideSessionReference(BaseModel):
+    """A session this entity was encountered in, derived from its sourced facts."""
+
+    session_id: uuid.UUID
+    title: str
+    session_date: date | None
+    fact_count: int
+
+
 class CampaignGuideResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -354,6 +362,11 @@ class CampaignGuideResponse(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+    # A guide entry is a reference for planning: what is known, and where it was
+    # met. The sessions are computed from fact lineage so they cannot drift from
+    # the findings that were actually approved, and are never model-authored.
+    fact_count: int = 0
+    sessions: list[GuideSessionReference] = Field(default_factory=list)
 
 
 class CampaignGuideFactCreate(BaseModel):
@@ -383,7 +396,7 @@ class CampaignGuideFactResponse(BaseModel):
 
 
 ANALYSIS_KINDS = {
-    "session_summary", "player_character", "npc", "monster", "location", "item", "creature",
+    "session_summary", "player_character", "npc", "location", "item", "creature",
     "quest", "faction", "deity", "rule", "important_decision", "unresolved_question",
     "scene", "memorable_moment", "follow_up", "table_note",
 }
