@@ -869,3 +869,61 @@ def test_a_paragraph_per_entry_recap_merges_into_one_ordered_recap() -> None:
     assert len(bodies) == 1
     for paragraph in paragraphs:
         assert paragraph in bodies[0]
+
+
+def test_candidate_budget_tracks_transcript_room_not_chunk_size() -> None:
+    from campaign_manager.analysis import candidate_budget
+
+    # The density the 16k chunk produced: ~9,000 characters of transcript, 8 findings.
+    assert candidate_budget(9_000) == 8
+    # A chunk that holds three times the transcript asks for proportionally more,
+    # up to the ceiling that keeps one response from being truncated.
+    assert candidate_budget(25_000) == 20
+    # Tiny chunks still ask for a useful minimum rather than zero.
+    assert candidate_budget(100) == 8
+
+
+def test_prompt_asks_for_more_candidates_when_the_chunk_holds_more_transcript() -> None:
+    session = GameSession(title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
+    segments = [{"start": i, "end": i + 1, "text": "x" * 60} for i in range(3_000)]
+
+    def asked_for(limit: int) -> int:
+        prompt, _ = build_analysis_prompt(session, [], segments, limit)
+        line = next(line for line in prompt.splitlines() if "Extract at most" in line)
+        return int(line.split("at most ")[1].split()[0])
+
+    small, large = asked_for(16_000), asked_for(44_000)
+    # The exact numbers depend on how much room the guide leaves, which is what
+    # candidate_budget is unit-tested for; what matters here is that a chunk holding
+    # more transcript asks for more, and that the ceiling still applies.
+    assert small < large <= 20
+    # The placeholder must never survive into the prompt.
+    prompt, _ = build_analysis_prompt(session, [], segments, 16_000)
+    assert "__CANDIDATE_BUDGET__" not in prompt
+
+
+def test_near_duplicate_titles_merge_into_one_finding() -> None:
+    from campaign_manager.analysis import merge_key_title
+
+    # A real run produced these three as separate unresolved questions.
+    variants = [
+        "Moth CR and Threat Level Discrepancy",
+        "Moth CR and Threat Level Discrepancy (Contextual Note)",
+        "Moth CR and Threat Level Discrepancy (Follow-up)",
+    ]
+    assert len({merge_key_title(title) for title in variants}) == 1
+
+    included = [(0, {"start": 1.0, "end": 2.0, "text": "The moths hit hard."})]
+    proposals = [
+        ExtractedProposal.model_validate({
+            "kind": "unresolved_question", "title": title, "body": f"body for {index}",
+            "aliases": [], "confidence": 0.5, "visibility": "gm",
+            "evidence": [{"segment_ids": [0], "quote": "The moths hit hard."}],
+        })
+        for index, title in enumerate(variants)
+    ]
+    merged = merge_chunk_proposals([(proposals, included)])
+    assert len(merged) == 1
+    # Nothing is thrown away: each variant's wording is kept in the survivor.
+    body = merged[0][0].body
+    assert all(f"body for {index}" in body for index in range(3))

@@ -36,9 +36,16 @@ class Settings:
     analysis_base_url: str = "http://ollama:11434"
     analysis_timeout_seconds: int = 21_600
     analysis_max_input_chars: int = 240_000
-    analysis_context_tokens: int = 16_384
+    # Measured on an 8 GB card holding a 4B model at q8_0, with the desktop using
+    # 2 GB: 16k context left 100% of the model on the GPU, 32k also 100%, and 48k
+    # spilled 15% to the CPU and halved output throughput. Chunks sized to fill 32k
+    # cut a 28-chunk session to 8 and its extraction from 14 minutes to under 4,
+    # with no truncation. The fixed rules and guide prefix costs about 7,000
+    # characters per chunk, so a small chunk spends most of its budget on
+    # boilerplate rather than transcript.
+    analysis_context_tokens: int = 32_768
     analysis_max_output_tokens: int = 4_096
-    analysis_chunk_chars: int = 16_000
+    analysis_chunk_chars: int = 32_000
     analysis_chunk_overlap_segments: int = 8
     # Ollama holds a model in VRAM for 5 minutes by default. On a single card
     # shared with transcription and image generation that blocks the next
@@ -84,11 +91,11 @@ class Settings:
             analysis_base_url=os.getenv("CAMPAIGN_ANALYSIS_BASE_URL", "http://ollama:11434").rstrip("/"),
             analysis_timeout_seconds=_integer_environment("CAMPAIGN_ANALYSIS_TIMEOUT_SECONDS", 21_600),
             analysis_max_input_chars=_integer_environment("CAMPAIGN_ANALYSIS_MAX_INPUT_CHARS", 240_000),
-            analysis_context_tokens=_integer_environment("CAMPAIGN_ANALYSIS_CONTEXT_TOKENS", 16_384),
+            analysis_context_tokens=_integer_environment("CAMPAIGN_ANALYSIS_CONTEXT_TOKENS", 32_768),
             analysis_max_output_tokens=_integer_environment(
                 "CAMPAIGN_ANALYSIS_MAX_OUTPUT_TOKENS", 4_096
             ),
-            analysis_chunk_chars=_integer_environment("CAMPAIGN_ANALYSIS_CHUNK_CHARS", 16_000),
+            analysis_chunk_chars=_integer_environment("CAMPAIGN_ANALYSIS_CHUNK_CHARS", 32_000),
             analysis_chunk_overlap_segments=_integer_environment(
                 "CAMPAIGN_ANALYSIS_CHUNK_OVERLAP_SEGMENTS", 8
             ),

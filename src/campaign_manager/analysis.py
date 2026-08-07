@@ -1007,6 +1007,19 @@ def build_analysis_prompts(
     return prompts
 
 
+def merge_key_title(title: str) -> str:
+    """The title reduced to what makes two findings the same finding.
+
+    Asked to merge duplicates, the model instead qualified them: one session ended
+    with "Moth CR and Threat Level Discrepancy", the same again as "(Contextual
+    Note)", and once more as "(Follow-up)", which an exact-title key kept apart.
+    Trailing parentheticals and punctuation are dropped so they collapse into one.
+    """
+    normalized = re.sub(r"\s*\([^)]*\)\s*$", "", title.strip())
+    normalized = re.sub(r"[^\w\s]", " ", normalized.casefold())
+    return re.sub(r"\s+", " ", normalized).strip() or title.casefold().strip()
+
+
 def merge_chunk_proposals(
     runs: list[tuple[list[ExtractedProposal], list[tuple[int, dict[str, Any]]]]]
 ) -> list[tuple[ExtractedProposal, list[dict[str, object]]]]:
@@ -1017,7 +1030,8 @@ def merge_chunk_proposals(
         for proposal in proposals:
             key = (
                 proposal.kind,
-                "session recap" if proposal.kind == "session_summary" else proposal.title.casefold().strip(),
+                "session recap" if proposal.kind == "session_summary"
+                else merge_key_title(proposal.title),
             )
             grounded = []
             for item in proposal.evidence:
@@ -1088,7 +1102,7 @@ def _deduplicate_consolidation_candidates(
         if proposal.kind not in entity_kinds:
             ordered.append(proposal)
             continue
-        key = (proposal.kind, proposal.title.casefold().strip())
+        key = (proposal.kind, merge_key_title(proposal.title))
         if key not in merged:
             merged[key] = proposal
             ordered.append(proposal)
@@ -1496,6 +1510,25 @@ def _source_segments(document: Any) -> list[dict[str, Any]]:
     raise ValueError("Analysis source has no readable text")
 
 
+# One candidate per this many characters of transcript, which is the density the
+# 16,000-character chunk produced: roughly 9,000 characters of transcript and 8
+# candidates. Raising the chunk size without raising the cap cut candidate density
+# by the same factor -- a 2.8x larger chunk still returned 8 candidates, so the run
+# got faster while covering less of the table.
+CHARS_PER_CANDIDATE = 1_200
+CANDIDATE_FLOOR = 8
+# The whole candidate list has to fit in one bounded response, so density stops
+# scaling here rather than risking a truncated chunk.
+CANDIDATE_CEILING = 20
+CANDIDATE_TOKEN = "__CANDIDATE_BUDGET__"
+
+
+def candidate_budget(transcript_chars: int) -> int:
+    """How many candidates to ask a chunk for, given how much source it holds."""
+    scaled = transcript_chars // CHARS_PER_CANDIDATE
+    return max(CANDIDATE_FLOOR, min(CANDIDATE_CEILING, scaled))
+
+
 def build_analysis_prompt(
     game_session: GameSession,
     guide: list[CampaignGuideEntry],
@@ -1508,6 +1541,9 @@ def build_analysis_prompt(
         f"- {entry.kind}: {entry.canonical_name}; aliases={', '.join(entry.aliases) or 'none'}; notes={entry.notes}"
         for entry in guide
     ]
+    # The rules and guide prefix costs several thousand characters, so the candidate
+    # budget is scaled to the room actually left for transcript rather than to the
+    # whole chunk. The prefix is written with a placeholder, measured, then filled in.
     prefix = f"""Analyze this tabletop RPG session for a GM review inbox.
 Session: {game_session.title}
 Session description: {game_session.description or 'none'}
@@ -1519,7 +1555,7 @@ Speakers in this transcript (already resolved; real player names are deliberatel
 {chr(10).join(f'- {line}' for line in (speaker_context or [])) or '- none'}
 
 Rules:
-- Extract at most 8 important source-supported candidates. Never invent; use guide spellings.
+- Extract at most {CANDIDATE_TOKEN} important source-supported candidates. Never invent; use guide spellings.
 - Do not summarize each chunk. A later pass builds the session recap.
 - Reusable entities have canonical-name-only titles. Actions/reactions are scenes or moments, not entities.
 - story: scenes, moments, entities, quests, decisions, and real in-fiction mysteries.
@@ -1540,6 +1576,9 @@ Rules:
 
 Source segments:
 """
+    prefix = prefix.replace(
+        CANDIDATE_TOKEN, str(candidate_budget(max(0, max_chars - len(prefix))))
+    )
     remaining = max(0, max_chars - len(prefix))
     included: list[tuple[int, dict[str, Any]]] = []
     lines: list[str] = []
