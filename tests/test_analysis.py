@@ -194,7 +194,7 @@ def test_prompt_respects_input_limit(tmp_path) -> None:
         campaign_id=session.campaign_id, kind="location", canonical_name="Wonderland",
         aliases=[], notes="", visibility="gm", created_by_id=session.created_by_id,
     )]
-    prompt, included = build_analysis_prompt(
+    prompt, included, _budget = build_analysis_prompt(
         session, guide, [{"start": index, "end": index + 1, "text": "x" * 40} for index in range(50)], max_chars,
     )
     assert len(prompt) <= max_chars
@@ -215,9 +215,9 @@ def test_analysis_prompts_cover_long_source_with_overlap_and_global_ids(tmp_path
     prompts = build_analysis_prompts(session, [], segments, max_chars=4_000, overlap_segments=2)
 
     assert len(prompts) > 1
-    covered = {index for _prompt, included in prompts for index, _segment in included}
+    covered = {index for chunk in prompts for index, _segment in chunk.segments}
     assert covered == set(range(40))
-    second_prompt, second_included = prompts[1]
+    second_prompt, second_included, _ = prompts[1]
     assert f"[{second_included[0][0]} " in second_prompt
     assert second_included[0][0] <= prompts[0][1][-1][0]
     assert {index for index, _segment in prompts[0][1]} & {
@@ -634,7 +634,9 @@ def test_trimming_never_discards_a_required_kind() -> None:
     # or confidence-only trimming is exactly how it used to be lost.
     bounded = _bounded_result([recap, *filler])
 
-    assert len(bounded) <= 40
+    # The ceiling is what the sections between them allow, not a separate number.
+    ceiling = sum(section.maximum or 0 for section in SECTIONS)
+    assert len(bounded) <= ceiling
     assert any(p.kind == "session_summary" for p in bounded)
 
 
@@ -708,7 +710,7 @@ def test_prompt_attributes_lines_to_characters_and_withholds_player_names(tmp_pa
     ]
     assign_speaker_pseudonyms(segments)
 
-    prompt, _ = build_analysis_prompt(session, [], segments, 4_000)
+    prompt, _segments, _budget = build_analysis_prompt(session, [], segments, 4_000)
 
     assert "Caelen: I open the door." in prompt
     assert "GM: The door creaks open." in prompt
@@ -749,13 +751,25 @@ def test_identity_guards_derive_from_campaign_data_not_hardcoded_names() -> None
     })
     assert _unsupported_identity_thread(merged, guide) is True
 
-    # Explicit identity language is legitimate and must survive.
+    # An identity claim survives when the cited transcript is what makes it, rather
+    # than the model's own prose. Identity language in the finding is the trigger for
+    # the check, never the evidence for it.
     supported = ExtractedProposal.model_validate({
         "kind": "unresolved_question", "title": "Aldermoor revealed to be Kip",
         "body": "Vess is actually Kip, revealed to be the same person.", "aliases": [],
-        "confidence": 0.9, "visibility": "gm", "evidence": [],
+        "confidence": 0.9, "visibility": "gm",
+        "evidence": [{"segment_ids": [4], "quote": "Aldermoor is actually Kip, you fools."}],
     })
     assert _unsupported_identity_thread(supported, guide) is False
+
+    # An ordinary question that happens to name two characters is not an identity
+    # claim and must survive. Dropping these cost one run every thread it had.
+    ordinary = ExtractedProposal.model_validate({
+        "kind": "unresolved_question", "title": "Will Aldermoor forgive Kip?",
+        "body": "Kip stole from Vess Aldermoor and has not admitted it.", "aliases": [],
+        "confidence": 0.7, "visibility": "gm", "evidence": [],
+    })
+    assert _unsupported_identity_thread(ordinary, guide) is False
 
     # Word boundaries: a short PC name must not match inside another word.
     # "Kip" appears inside "Kipling", which previously tripped the guard.
@@ -888,7 +902,7 @@ def test_prompt_asks_for_more_candidates_when_the_chunk_holds_more_transcript() 
     segments = [{"start": i, "end": i + 1, "text": "x" * 60} for i in range(3_000)]
 
     def asked_for(limit: int) -> int:
-        prompt, _ = build_analysis_prompt(session, [], segments, limit)
+        prompt = build_analysis_prompt(session, [], segments, limit).prompt
         line = next(line for line in prompt.splitlines() if "Extract at most" in line)
         return int(line.split("at most ")[1].split()[0])
 
@@ -898,7 +912,7 @@ def test_prompt_asks_for_more_candidates_when_the_chunk_holds_more_transcript() 
     # more transcript asks for more, and that the ceiling still applies.
     assert small < large <= 20
     # The placeholder must never survive into the prompt.
-    prompt, _ = build_analysis_prompt(session, [], segments, 16_000)
+    prompt = build_analysis_prompt(session, [], segments, 16_000).prompt
     assert "__CANDIDATE_BUDGET__" not in prompt
 
 
@@ -927,3 +941,45 @@ def test_near_duplicate_titles_merge_into_one_finding() -> None:
     # Nothing is thrown away: each variant's wording is kept in the survivor.
     body = merged[0][0].body
     assert all(f"body for {index}" in body for index in range(3))
+
+
+def test_consolidation_reports_what_each_section_dropped(tmp_path) -> None:
+    # A section that returned findings and kept none used to be indistinguishable
+    # from one that was never asked, which is how a run lost every thread it had.
+    session = GameSession(title="Test", description="", campaign_id=uuid.uuid4(), created_by_id=uuid.uuid4())
+    candidates = [
+        ExtractedProposal.model_validate({
+            "kind": kind, "title": f"{kind} {index}", "body": "Body.", "aliases": [],
+            "confidence": 0.8, "visibility": "gm",
+            "evidence": [{"segment_ids": [index], "quote": "quote"}],
+        })
+        for index, kind in enumerate(
+            ["scene", "scene", "npc", "location", "quest", "unresolved_question", "rule"]
+        )
+    ]
+
+    def analyze(prompt, model, schema):
+        kinds = schema["properties"]["proposals"]["items"]["properties"]["kind"]["enum"]
+        # Answer every section with one entry of its first allowed kind.
+        return AnalysisResult.model_validate({"proposals": [{
+            "kind": kinds[0], "title": f"{kinds[0]} out", "body": "Body.", "aliases": [],
+            "confidence": 0.8, "visibility": "gm",
+            "evidence": [{"segment_ids": [0], "quote": "quote"}],
+        }]}), {"done_reason": "stop"}
+
+    result, metadata = consolidate_analysis(
+        session, [], [], candidates, analyze, "test-model", 40_000
+    )
+    sections = {entry["section"]: entry for entry in metadata if "section" in entry}
+    assert {"recap", "scenes", "entities", "threads", "meta"} <= set(sections)
+    for name, entry in sections.items():
+        if name == "assembly":
+            continue
+        assert entry["returned"] >= 1, name
+        assert entry["kept"] >= 1, name
+        # Every drop is accounted for, so a zero-kept section is visible.
+        assert entry["returned"] == (
+            entry["kept"] + entry["dropped_wrong_kind"] + entry["dropped_by_guard"]
+            + entry["dropped_over_section_limit"]
+        ), name
+    assert [p.kind for p in result.proposals].count("session_summary") == 1

@@ -8,10 +8,11 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import Any, Literal, get_args
+from typing import Any, Literal, NamedTuple, get_args
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import select
@@ -672,10 +673,12 @@ def process_analysis_job(
     if resume_proposals:
         extracted_runs.append((resume_proposals, list(enumerate(segments))))
     else:
-        for chunk_index, (prompt, included) in enumerate(prompts):
+        for chunk_index, chunk in enumerate(prompts):
+            prompt, included = chunk.prompt, chunk.segments
             try:
                 result, metadata = analyzer(
-                    prompt, analysis_settings.analysis_model, ANALYSIS_RESPONSE_SCHEMA
+                    prompt, analysis_settings.analysis_model,
+                    extraction_schema(chunk.candidate_budget),
                 )
             except Exception as exc:  # noqa: BLE001 - one chunk must not lose the rest
                 # A single unusable chunk previously failed the entire job, so a
@@ -989,17 +992,17 @@ def build_analysis_prompts(
     max_chars: int,
     overlap_segments: int = 8,
     speaker_context: list[str] | None = None,
-) -> list[tuple[str, list[tuple[int, dict[str, Any]]]]]:
+) -> list[AnalysisChunk]:
     """Build bounded prompts while retaining global source-segment identities."""
     prompts = []
     cursor = 0
     while cursor < len(segments):
-        prompt, local_included = build_analysis_prompt(
+        chunk = build_analysis_prompt(
             game_session, guide, segments[cursor:], max_chars,
             start_index=cursor, speaker_context=speaker_context,
         )
-        prompts.append((prompt, local_included))
-        consumed = len(local_included)
+        prompts.append(chunk)
+        consumed = len(chunk.segments)
         if cursor + consumed >= len(segments):
             break
         effective_overlap = min(max(0, overlap_segments), max(0, consumed // 5))
@@ -1212,6 +1215,18 @@ SECTIONS: tuple[SectionSpec, ...] = (
 )
 
 
+def extraction_schema(max_items: int) -> dict[str, Any]:
+    """Cap the candidate list in the grammar rather than only asking for a cap.
+
+    Told to return at most 18, one chunk returned 30 and ran past the output token
+    limit; the truncation salvage recovered it, but a cap the sampler enforces means
+    the overrun cannot happen in the first place.
+    """
+    schema = deepcopy(ANALYSIS_RESPONSE_SCHEMA)
+    schema["properties"]["proposals"]["maxItems"] = max_items
+    return schema
+
+
 def _section_schema(output_kinds: tuple[str, ...]) -> dict[str, Any]:
     """Restrict the response grammar to one section's kinds.
 
@@ -1260,14 +1275,36 @@ def _finalize_analysis_sections(
             )
             result, retry_response = analyzer(retry_prompt, model, schema)
             response = {**response, "retry": retry_response}
+        returned = len(result.proposals)
         kept = [p for p in result.proposals if p.kind in section.output_kinds]
+        wrong_kind = returned - len(kept)
+        guarded = 0
         if section.name == "threads":
+            before = len(kept)
             kept = [p for p in kept if not _unsupported_identity_thread(p, guide)]
+            guarded = before - len(kept)
+        trimmed = _trim_section(kept, section)
         if section.required and not kept:
             response = {**response, "missing_required_section": section.name}
-        combined.extend(_trim_section(kept, section))
-        metadata.append({"stage": "finalizing", "section": section.name, **response})
-    return AnalysisResult(proposals=_bounded_result(combined)), metadata
+        combined.extend(trimmed)
+        # Every drop is counted. A section that returned findings and kept none used
+        # to look identical to a section that was never asked, which is how an entire
+        # run lost its quests and open questions without anything saying so.
+        metadata.append({
+            "stage": "finalizing", "section": section.name,
+            "candidates": len(candidates), "returned": returned, "kept": len(trimmed),
+            "dropped_wrong_kind": wrong_kind, "dropped_by_guard": guarded,
+            "dropped_over_section_limit": len(kept) - len(trimmed),
+            **response,
+        })
+    bounded = _bounded_result(combined)
+    if len(bounded) < len(combined):
+        dropped = Counter(p.kind for p in combined) - Counter(p.kind for p in bounded)
+        metadata.append({
+            "stage": "finalizing", "section": "assembly",
+            "dropped_over_response_ceiling": dict(dropped),
+        })
+    return AnalysisResult(proposals=bounded), metadata
 
 
 def _trim_section(
@@ -1293,8 +1330,14 @@ def _trim_section(
 
 
 def _bounded_result(proposals: list[ExtractedProposal]) -> list[ExtractedProposal]:
-    """Respect the response ceiling without letting a required kind fall off."""
-    ceiling = 40
+    """Respect the response ceiling without letting a required kind fall off.
+
+    The ceiling is the sum of what the sections already allow, so it is a backstop
+    rather than a second opinion. A flat 40 silently reordered every section's output
+    by confidence and dropped the tail: one run lost all ten of its threads, which
+    score lower than scenes and entities by nature, and nothing recorded it.
+    """
+    ceiling = sum(section.maximum or 0 for section in SECTIONS)
     if len(proposals) <= ceiling:
         return proposals
     required = [p for p in proposals if p.kind in REQUIRED_KINDS]
@@ -1341,27 +1384,44 @@ def _spread_chronological_scenes(scenes: list[ExtractedProposal]) -> list[Extrac
     return result
 
 
+# Phrases that turn a question into a claim that two names are one person. "the
+# same" alone is too common ("at the same time") to belong here.
+IDENTITY_CLAIM_TERMS = (
+    "also known as", "alias", "revealed to be", "is actually", "same person",
+    "impersonat", "the same as", "are the same", "is the same", "really is",
+    "secretly", "in disguise", "true identity",
+)
+
+
 def _unsupported_identity_thread(
     proposal: ExtractedProposal, guide: list[CampaignGuideEntry]
 ) -> bool:
-    """Drop threads that merge two player characters without textual support.
+    """Drop a thread that claims two characters are one person without a source.
 
     Matching is per entity across canonical name and aliases, on word boundaries.
     Canonical-name-only substring matching both missed real merges, because
     "Magnus vs. Torin" names neither "Magnus Heartsbane" nor "Norixius Torrin"
     in full, and fired falsely, because "Bit" is a substring of "rabbit".
+
+    Only an identity claim is judged. The earlier form dropped any question naming
+    two player characters unless it used identity language, which is backwards: it
+    kept the invented merges and threw away ordinary questions about two characters,
+    and in one run that was every thread the session had.
     """
     if proposal.kind != "unresolved_question":
         return False
     text = f"{proposal.title} {proposal.body}"
+    if not any(term in text.casefold() for term in IDENTITY_CLAIM_TERMS):
+        return False
     mentioned = sum(
         1 for entry in guide
         if entry.kind == "player_character" and _mentions_entity(text, entry)
     )
     if mentioned < 2:
         return False
-    explicit = ("also known as", "alias", "revealed to be", "is actually", "same person", "impersonat")
-    return not any(term in text.casefold() for term in explicit)
+    # The claim stands only if the cited transcript says it, not the model.
+    quoted = " ".join(item.quote for item in proposal.evidence).casefold()
+    return not any(term in quoted for term in IDENTITY_CLAIM_TERMS)
 
 
 def _mentions_entity(text: str, entry: CampaignGuideEntry) -> bool:
@@ -1529,6 +1589,14 @@ def candidate_budget(transcript_chars: int) -> int:
     return max(CANDIDATE_FLOOR, min(CANDIDATE_CEILING, scaled))
 
 
+class AnalysisChunk(NamedTuple):
+    """One extraction prompt, the segments it covers, and how many findings it may return."""
+
+    prompt: str
+    segments: list[tuple[int, dict[str, Any]]]
+    candidate_budget: int
+
+
 def build_analysis_prompt(
     game_session: GameSession,
     guide: list[CampaignGuideEntry],
@@ -1536,7 +1604,7 @@ def build_analysis_prompt(
     max_chars: int,
     start_index: int = 0,
     speaker_context: list[str] | None = None,
-) -> tuple[str, list[tuple[int, dict[str, Any]]]]:
+) -> AnalysisChunk:
     guide_lines = [
         f"- {entry.kind}: {entry.canonical_name}; aliases={', '.join(entry.aliases) or 'none'}; notes={entry.notes}"
         for entry in guide
@@ -1576,9 +1644,8 @@ Rules:
 
 Source segments:
 """
-    prefix = prefix.replace(
-        CANDIDATE_TOKEN, str(candidate_budget(max(0, max_chars - len(prefix))))
-    )
+    budget = candidate_budget(max(0, max_chars - len(prefix)))
+    prefix = prefix.replace(CANDIDATE_TOKEN, str(budget))
     remaining = max(0, max_chars - len(prefix))
     included: list[tuple[int, dict[str, Any]]] = []
     lines: list[str] = []
@@ -1596,7 +1663,7 @@ Source segments:
         remaining -= len(line) + 1
     if not included:
         raise ValueError("Analysis input limit is too small for any source text")
-    return prefix + "\n".join(lines), included
+    return AnalysisChunk(prefix + "\n".join(lines), included, budget)
 
 
 def ollama_analyzer(settings: Settings) -> Analyze:
