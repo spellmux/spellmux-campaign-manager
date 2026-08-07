@@ -13,31 +13,38 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import func, select, text
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import Text, case, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from campaign_manager import __version__
-from campaign_manager.analysis import ollama_status
 from campaign_manager.artifacts import ingest_audio, ingest_text
 from campaign_manager.auth import authenticate, current_user, issue_token, revoke_token
 from campaign_manager.comparison import compare_transcripts
+from campaign_manager.compute import effective_analysis_status, probe_ollama
 from campaign_manager.config import Settings
 from campaign_manager.database import database_session
 from campaign_manager.diarization import attribute_transcript_segments, cluster_resolutions
 from campaign_manager.models import (
     AnalysisProposal,
+    AnalysisRun,
     Artifact,
     Campaign,
     CampaignGuideEntry,
+    CampaignGuideFact,
     CampaignMembership,
     CampaignRole,
+    ChronicleEntry,
+    ComputeWorker,
     GameSession,
     Job,
     ProcessingControl,
     SessionPublication,
+    SpeakerCharacterAssignment,
     SpeakerProfile,
     SpeakerReview,
+    SpeakerVoiceprint,
     User,
 )
 from campaign_manager.permissions import require_campaign_role
@@ -57,12 +64,23 @@ from campaign_manager.schemas import (
     AnalysisProposalResponse,
     AnalysisProposalUpdate,
     AnalysisRunCreate,
+    AnalysisRunResponse,
     ArtifactResponse,
     CampaignCreate,
     CampaignGuideCreate,
+    CampaignGuideFactCreate,
+    CampaignGuideFactResponse,
     CampaignGuideResponse,
     CampaignGuideUpdate,
     CampaignResponse,
+    CampaignUpdate,
+    ChronicleEntryResponse,
+    ChronicleEntryUpdate,
+    ComputeWorkerCreate,
+    ComputeWorkerResponse,
+    ComputeWorkerTestResponse,
+    ComputeWorkerUpdate,
+    GuideSessionReference,
     JobPriorityUpdate,
     JobResponse,
     LoginRequest,
@@ -73,14 +91,19 @@ from campaign_manager.schemas import (
     PublicationResponse,
     PublicationUpdate,
     QueueJobResponse,
+    QueueMoveRequest,
     SessionCreate,
     SessionResponse,
     SessionUpdate,
+    SpeakerCharacterAssignmentCreate,
+    SpeakerCharacterAssignmentResponse,
+    SpeakerCharacterAssignmentUpdate,
     SpeakerProfileCreate,
     SpeakerProfileResponse,
     SpeakerProfileUpdate,
     SpeakerReviewCreate,
     SpeakerReviewResponse,
+    SpeakerVoiceprintResponse,
     TextSourceCreate,
     TextSourceUpdate,
     TokenResponse,
@@ -104,6 +127,11 @@ def _campaign_response(campaign: Campaign, role: str) -> CampaignResponse:
         slug=campaign.slug,
         name=campaign.name,
         description=campaign.description,
+        game_system=campaign.game_system,
+        play_mode=campaign.play_mode,
+        vtt=campaign.vtt,
+        character_source=campaign.character_source,
+        notes=campaign.notes,
         created_at=campaign.created_at,
         role=role,
     )
@@ -112,6 +140,8 @@ def _campaign_response(campaign: Campaign, role: str) -> CampaignResponse:
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings.from_environment()
     app = FastAPI(title="Campaign Manager", version=__version__)
+    static_root = Path(__file__).parent / "static"
+    app.mount("/assets", StaticFiles(directory=static_root / "assets"), name="assets")
 
     @app.middleware("http")
     async def security_headers(request, call_next):
@@ -128,7 +158,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
-        return FileResponse(Path(__file__).parent / "static" / "index.html")
+        return FileResponse(static_root / "index.html")
 
     @app.get("/api/v1/health", tags=["system"])
     def health() -> dict[str, object]:
@@ -167,9 +197,126 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return user
 
     @app.get("/api/v1/analysis/status", tags=["analysis-review"])
-    def analysis_status(user: User = Depends(current_user)) -> dict[str, object]:
+    def analysis_status(
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> dict[str, object]:
         del user
-        return ollama_status(resolved)
+        return effective_analysis_status(database, resolved)
+
+    def require_instance_admin(user: User) -> None:
+        if not user.is_instance_admin:
+            raise HTTPException(status_code=403, detail="Instance administrator required")
+
+    @app.get(
+        "/api/v1/compute-workers",
+        response_model=list[ComputeWorkerResponse],
+        tags=["compute-workers"],
+    )
+    def list_compute_workers(
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[ComputeWorker]:
+        require_instance_admin(user)
+        return list(database.scalars(
+            select(ComputeWorker).order_by(ComputeWorker.priority.desc(), ComputeWorker.name)
+        ))
+
+    @app.post(
+        "/api/v1/compute-workers",
+        response_model=ComputeWorkerResponse,
+        status_code=201,
+        tags=["compute-workers"],
+    )
+    def create_compute_worker(
+        request: ComputeWorkerCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> ComputeWorker:
+        require_instance_admin(user)
+        worker = ComputeWorker(**request.model_dump(), created_by_id=user.id)
+        database.add(worker)
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="Compute worker name already exists") from exc
+        database.refresh(worker)
+        return worker
+
+    def managed_compute_worker(
+        database: Session, user: User, worker_id: uuid.UUID
+    ) -> ComputeWorker:
+        require_instance_admin(user)
+        worker = database.get(ComputeWorker, worker_id)
+        if worker is None:
+            raise HTTPException(status_code=404, detail="Compute worker not found")
+        return worker
+
+    @app.put(
+        "/api/v1/compute-workers/{worker_id}",
+        response_model=ComputeWorkerResponse,
+        tags=["compute-workers"],
+    )
+    def update_compute_worker(
+        worker_id: uuid.UUID,
+        request: ComputeWorkerUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> ComputeWorker:
+        worker = managed_compute_worker(database, user, worker_id)
+        for field, value in request.model_dump().items():
+            setattr(worker, field, value)
+        worker.last_status = "unknown"
+        worker.last_error = None
+        worker.available_models = []
+        worker.last_checked_at = None
+        worker.updated_at = datetime.now(UTC)
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="Compute worker name already exists") from exc
+        database.refresh(worker)
+        return worker
+
+    @app.delete(
+        "/api/v1/compute-workers/{worker_id}",
+        status_code=204,
+        tags=["compute-workers"],
+    )
+    def delete_compute_worker(
+        worker_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> None:
+        worker = managed_compute_worker(database, user, worker_id)
+        database.delete(worker)
+        database.commit()
+
+    @app.post(
+        "/api/v1/compute-workers/{worker_id}/test",
+        response_model=ComputeWorkerTestResponse,
+        tags=["compute-workers"],
+    )
+    def test_compute_worker(
+        worker_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> ComputeWorkerTestResponse:
+        worker = managed_compute_worker(database, user, worker_id)
+        result = probe_ollama(worker.base_url, worker.analysis_model, timeout=10)
+        worker.last_status = "ready" if result["ready"] else "unavailable"
+        worker.last_error = result.get("detail")
+        worker.available_models = result["models"]
+        worker.last_checked_at = datetime.now(UTC)
+        worker.updated_at = datetime.now(UTC)
+        database.commit()
+        database.refresh(worker)
+        return ComputeWorkerTestResponse(
+            worker=ComputeWorkerResponse.model_validate(worker),
+            ready=result["ready"], models=result["models"], detail=result.get("detail"),
+        )
 
     @app.get("/api/v1/campaigns", response_model=list[CampaignResponse], tags=["campaigns"])
     def list_campaigns(
@@ -218,6 +365,101 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.refresh(campaign)
         return _campaign_response(campaign, CampaignRole.OWNER.value)
 
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}",
+        response_model=CampaignResponse,
+        tags=["campaigns"],
+    )
+    def update_campaign(
+        campaign_id: uuid.UUID,
+        request: CampaignUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> CampaignResponse:
+        membership = require_campaign_role(
+            database,
+            user,
+            campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        campaign = database.get(Campaign, campaign_id)
+        if campaign is None:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        campaign.name = request.name.strip()
+        campaign.description = request.description.strip()
+        campaign.game_system = request.game_system.strip()
+        campaign.play_mode = request.play_mode
+        campaign.vtt = request.vtt.strip()
+        campaign.character_source = request.character_source.strip()
+        campaign.notes = request.notes.strip()
+        database.commit()
+        database.refresh(campaign)
+        return _campaign_response(campaign, membership.role)
+
+    def guide_session_references(
+        database: Session, campaign_id: uuid.UUID, players_only: bool
+    ) -> dict[uuid.UUID, list[GuideSessionReference]]:
+        """Which sessions each guide entity was encountered in.
+
+        Derived from the facts approvals leave behind rather than stored on the
+        entry, so it cannot fall out of step with the findings that produced it.
+        Aggregated for the whole campaign in one query: doing it per entry made
+        the guide N+1 queries deep on a campaign with hundreds of entities.
+        """
+        statement = (
+            select(
+                CampaignGuideFact.guide_entry_id,
+                GameSession.id,
+                GameSession.title,
+                GameSession.session_date,
+                func.count(CampaignGuideFact.id),
+            )
+            .join(GameSession, GameSession.id == CampaignGuideFact.session_id)
+            .join(
+                CampaignGuideEntry,
+                CampaignGuideEntry.id == CampaignGuideFact.guide_entry_id,
+            )
+            .where(CampaignGuideEntry.campaign_id == campaign_id)
+            .group_by(
+                CampaignGuideFact.guide_entry_id,
+                GameSession.id,
+                GameSession.title,
+                GameSession.session_date,
+            )
+            # Undated sessions sort last rather than first, where a NULL would put
+            # them, because an unscheduled session is not the earliest encounter.
+            .order_by(
+                CampaignGuideFact.guide_entry_id,
+                GameSession.session_date.is_(None),
+                GameSession.session_date,
+                GameSession.title,
+            )
+        )
+        if players_only:
+            statement = statement.where(
+                CampaignGuideFact.visibility == "player",
+                CampaignGuideFact.status == "canonical",
+            )
+        references: dict[uuid.UUID, list[GuideSessionReference]] = {}
+        for entry_id, session_id, title, session_date, fact_count in database.execute(statement):
+            references.setdefault(entry_id, []).append(
+                GuideSessionReference(
+                    session_id=session_id,
+                    title=title,
+                    session_date=session_date,
+                    fact_count=fact_count,
+                )
+            )
+        return references
+
+    def guide_entry_response(
+        entry: CampaignGuideEntry, sessions: list[GuideSessionReference]
+    ) -> CampaignGuideResponse:
+        response = CampaignGuideResponse.model_validate(entry)
+        response.sessions = sessions
+        response.fact_count = sum(reference.fact_count for reference in sessions)
+        return response
+
     @app.get(
         "/api/v1/campaigns/{campaign_id}/guide",
         response_model=list[CampaignGuideResponse],
@@ -225,21 +467,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def list_campaign_guide(
         campaign_id: uuid.UUID,
+        kind: str | None = Query(default=None),
+        search: str | None = Query(default=None),
         user: User = Depends(current_user),
         database: Session = Depends(database_session),
-    ) -> list[CampaignGuideEntry]:
+    ) -> list[CampaignGuideResponse]:
         membership = require_campaign_role(database, user, campaign_id)
         statement = select(CampaignGuideEntry).where(
             CampaignGuideEntry.campaign_id == campaign_id,
             CampaignGuideEntry.is_active.is_(True),
         )
-        if membership.role == CampaignRole.PLAYER.value:
+        players_only = membership.role == CampaignRole.PLAYER.value
+        if players_only:
             statement = statement.where(CampaignGuideEntry.visibility == "player")
-        return list(
+        if kind:
+            statement = statement.where(CampaignGuideEntry.kind == kind.strip().casefold())
+        if search and search.strip():
+            # Aliases are where a mishearing usually lives, so a name search that
+            # ignored them would miss the entry the GM is looking for.
+            needle = f"%{search.strip().casefold()}%"
+            statement = statement.where(
+                func.lower(CampaignGuideEntry.canonical_name).like(needle)
+                | func.lower(func.cast(CampaignGuideEntry.aliases, Text)).like(needle)
+                | func.lower(CampaignGuideEntry.notes).like(needle)
+            )
+        entries = list(
             database.scalars(
                 statement.order_by(CampaignGuideEntry.kind, CampaignGuideEntry.canonical_name)
             )
         )
+        references = guide_session_references(database, campaign_id, players_only)
+        return [guide_entry_response(entry, references.get(entry.id, [])) for entry in entries]
 
     @app.post(
         "/api/v1/campaigns/{campaign_id}/guide",
@@ -291,7 +549,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: CampaignGuideUpdate,
         user: User = Depends(current_user),
         database: Session = Depends(database_session),
-    ) -> CampaignGuideEntry:
+    ) -> CampaignGuideResponse:
         require_campaign_role(database, user, campaign_id, {"owner", "gm"})
         entry = database.scalar(select(CampaignGuideEntry).where(
             CampaignGuideEntry.id == entry_id,
@@ -310,7 +568,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             database.rollback()
             raise HTTPException(status_code=409, detail="Campaign Guide name already exists") from exc
         database.refresh(entry)
-        return entry
+        references = guide_session_references(database, campaign_id, players_only=False)
+        return guide_entry_response(entry, references.get(entry.id, []))
 
     @app.delete("/api/v1/campaigns/{campaign_id}/guide/{entry_id}", status_code=204)
     def delete_campaign_guide_entry(
@@ -328,6 +587,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Campaign Guide entry not found")
         database.delete(entry)
         database.commit()
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/guide/{entry_id}/facts",
+        response_model=list[CampaignGuideFactResponse],
+        tags=["campaign-guide"],
+    )
+    def list_campaign_guide_facts(
+        campaign_id: uuid.UUID, entry_id: uuid.UUID,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> list[CampaignGuideFact]:
+        membership = require_campaign_role(database, user, campaign_id)
+        entry = database.scalar(select(CampaignGuideEntry).where(
+            CampaignGuideEntry.id == entry_id, CampaignGuideEntry.campaign_id == campaign_id,
+            CampaignGuideEntry.is_active.is_(True),
+        ))
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Campaign Guide entry not found")
+        statement = select(CampaignGuideFact).where(CampaignGuideFact.guide_entry_id == entry_id)
+        if membership.role == CampaignRole.PLAYER.value:
+            statement = statement.where(CampaignGuideFact.visibility == "player", CampaignGuideFact.status == "canonical")
+        return list(database.scalars(statement.order_by(CampaignGuideFact.created_at)))
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/guide/{entry_id}/facts",
+        response_model=CampaignGuideFactResponse,
+        status_code=201,
+        tags=["campaign-guide"],
+    )
+    def create_campaign_guide_fact(
+        campaign_id: uuid.UUID, entry_id: uuid.UUID, request: CampaignGuideFactCreate,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> CampaignGuideFact:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        entry = database.scalar(select(CampaignGuideEntry).where(
+            CampaignGuideEntry.id == entry_id, CampaignGuideEntry.campaign_id == campaign_id,
+        ))
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Campaign Guide entry not found")
+        if request.session_id is not None and database.scalar(select(GameSession.id).where(
+            GameSession.id == request.session_id, GameSession.campaign_id == campaign_id,
+        )) is None:
+            raise HTTPException(status_code=422, detail="Fact session must belong to this campaign")
+        fact = CampaignGuideFact(
+            guide_entry_id=entry_id, session_id=request.session_id, category=request.category.strip().casefold(),
+            value=request.value.strip(), status=request.status.strip().casefold(), confidence=request.confidence,
+            visibility=request.visibility, created_by_id=user.id,
+        )
+        database.add(fact)
+        database.commit()
+        database.refresh(fact)
+        return fact
 
     @app.get(
         "/api/v1/campaigns/{campaign_id}/speakers",
@@ -352,6 +662,80 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 .order_by(SpeakerProfile.display_name)
             )
         )
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/voiceprints",
+        response_model=list[SpeakerVoiceprintResponse],
+        tags=["speaker-review"],
+    )
+    def list_speaker_voiceprints(
+        campaign_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[SpeakerVoiceprintResponse]:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        rows = database.execute(
+            select(SpeakerVoiceprint, SpeakerProfile)
+            .join(SpeakerProfile, SpeakerProfile.id == SpeakerVoiceprint.speaker_profile_id)
+            .where(SpeakerProfile.campaign_id == campaign_id)
+            .order_by(SpeakerProfile.display_name)
+        ).all()
+        return [
+            SpeakerVoiceprintResponse(
+                id=voiceprint.id,
+                speaker_profile_id=voiceprint.speaker_profile_id,
+                speaker_name=profile.display_name,
+                embedding_model=voiceprint.embedding_model,
+                dimensions=len(voiceprint.embedding or []),
+                sample_count=voiceprint.sample_count,
+                sample_seconds=voiceprint.sample_seconds,
+                source_session_ids=[str(value) for value in voiceprint.source_session_ids],
+                updated_at=voiceprint.updated_at,
+            )
+            for voiceprint, profile in rows
+        ]
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/voiceprints",
+        response_model=JobResponse,
+        status_code=202,
+        tags=["speaker-review"],
+    )
+    def queue_speaker_enrollment(
+        campaign_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Job:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        approved = database.scalar(
+            select(func.count(SpeakerReview.id))
+            .join(GameSession, GameSession.id == SpeakerReview.session_id)
+            .where(
+                GameSession.campaign_id == campaign_id,
+                SpeakerReview.disposition == "confirmed",
+                SpeakerReview.approved_reference.is_(True),
+            )
+        ) or 0
+        if approved == 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Approve at least one clip as a voice reference before enrolling",
+            )
+        active = database.scalar(select(Job.id).where(
+            Job.kind == "speaker_enrollment",
+            Job.status.in_({"queued", "running"}),
+            Job.payload["campaign_id"].as_string() == str(campaign_id),
+        ))
+        if active is not None:
+            raise HTTPException(status_code=409, detail="Speaker enrollment is already queued")
+        job = Job(
+            kind="speaker_enrollment",
+            payload={"campaign_id": str(campaign_id), "requested_by_id": str(user.id)},
+        )
+        database.add(job)
+        database.commit()
+        database.refresh(job)
+        return job
 
     @app.post(
         "/api/v1/campaigns/{campaign_id}/speakers",
@@ -430,6 +814,192 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if profile is None:
             raise HTTPException(status_code=404, detail="Speaker not found")
         database.delete(profile)
+        database.commit()
+
+    def speaker_assignment_response(
+        assignment: SpeakerCharacterAssignment,
+        speaker: SpeakerProfile,
+        character: CampaignGuideEntry,
+        game_session: GameSession | None,
+    ) -> SpeakerCharacterAssignmentResponse:
+        return SpeakerCharacterAssignmentResponse(
+            id=assignment.id,
+            speaker_profile_id=assignment.speaker_profile_id,
+            speaker_name=speaker.display_name,
+            guide_entry_id=assignment.guide_entry_id,
+            character_name=character.canonical_name,
+            session_id=assignment.session_id,
+            session_title=game_session.title if game_session else None,
+            is_primary=assignment.is_primary,
+            notes=assignment.notes,
+            created_at=assignment.created_at,
+        )
+
+    def validate_speaker_character_scope(
+        database: Session,
+        campaign_id: uuid.UUID,
+        speaker_profile_id: uuid.UUID,
+        guide_entry_id: uuid.UUID,
+        session_id: uuid.UUID | None,
+    ) -> tuple[SpeakerProfile, CampaignGuideEntry, GameSession | None]:
+        speaker = database.scalar(select(SpeakerProfile).where(
+            SpeakerProfile.id == speaker_profile_id,
+            SpeakerProfile.campaign_id == campaign_id,
+        ))
+        if speaker is None:
+            raise HTTPException(status_code=404, detail="Speaker not found")
+        character = database.scalar(select(CampaignGuideEntry).where(
+            CampaignGuideEntry.id == guide_entry_id,
+            CampaignGuideEntry.campaign_id == campaign_id,
+            CampaignGuideEntry.is_active.is_(True),
+        ))
+        if character is None:
+            raise HTTPException(status_code=404, detail="Campaign Guide entry not found")
+        if character.kind not in {"player_character", "character"}:
+            raise HTTPException(
+                status_code=422, detail="Speakers can only be assigned to Player Characters"
+            )
+        game_session = None
+        if session_id is not None:
+            game_session = database.scalar(select(GameSession).where(
+                GameSession.id == session_id,
+                GameSession.campaign_id == campaign_id,
+            ))
+            if game_session is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+        return speaker, character, game_session
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/speaker-character-assignments",
+        response_model=list[SpeakerCharacterAssignmentResponse],
+        tags=["speaker-review"],
+    )
+    def list_speaker_character_assignments(
+        campaign_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[SpeakerCharacterAssignmentResponse]:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        rows = database.execute(
+            select(SpeakerCharacterAssignment, SpeakerProfile, CampaignGuideEntry, GameSession)
+            .join(SpeakerProfile, SpeakerProfile.id == SpeakerCharacterAssignment.speaker_profile_id)
+            .join(CampaignGuideEntry, CampaignGuideEntry.id == SpeakerCharacterAssignment.guide_entry_id)
+            .outerjoin(GameSession, GameSession.id == SpeakerCharacterAssignment.session_id)
+            .where(SpeakerProfile.campaign_id == campaign_id)
+            .order_by(SpeakerProfile.display_name, SpeakerCharacterAssignment.is_primary.desc())
+        ).all()
+        return [speaker_assignment_response(*row) for row in rows]
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/speaker-character-assignments",
+        response_model=SpeakerCharacterAssignmentResponse,
+        status_code=201,
+        tags=["speaker-review"],
+    )
+    def create_speaker_character_assignment(
+        campaign_id: uuid.UUID,
+        request: SpeakerCharacterAssignmentCreate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> SpeakerCharacterAssignmentResponse:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        speaker, character, game_session = validate_speaker_character_scope(
+            database, campaign_id, request.speaker_profile_id,
+            request.guide_entry_id, request.session_id,
+        )
+        if request.is_primary:
+            existing = database.scalars(select(SpeakerCharacterAssignment).where(
+                SpeakerCharacterAssignment.speaker_profile_id == speaker.id,
+                SpeakerCharacterAssignment.session_id == request.session_id,
+            )).all()
+            for assignment in existing:
+                assignment.is_primary = False
+        assignment = SpeakerCharacterAssignment(
+            speaker_profile_id=speaker.id,
+            guide_entry_id=character.id,
+            session_id=request.session_id,
+            is_primary=request.is_primary,
+            notes=request.notes.strip(),
+            created_by_id=user.id,
+        )
+        database.add(assignment)
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="Speaker assignment already exists") from exc
+        database.refresh(assignment)
+        return speaker_assignment_response(assignment, speaker, character, game_session)
+
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}/speaker-character-assignments/{assignment_id}",
+        response_model=SpeakerCharacterAssignmentResponse,
+        tags=["speaker-review"],
+    )
+    def update_speaker_character_assignment(
+        campaign_id: uuid.UUID,
+        assignment_id: uuid.UUID,
+        request: SpeakerCharacterAssignmentUpdate,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> SpeakerCharacterAssignmentResponse:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        assignment = database.scalar(
+            select(SpeakerCharacterAssignment)
+            .join(SpeakerProfile, SpeakerProfile.id == SpeakerCharacterAssignment.speaker_profile_id)
+            .where(
+                SpeakerCharacterAssignment.id == assignment_id,
+                SpeakerProfile.campaign_id == campaign_id,
+            )
+        )
+        if assignment is None:
+            raise HTTPException(status_code=404, detail="Speaker assignment not found")
+        speaker, character, game_session = validate_speaker_character_scope(
+            database, campaign_id, assignment.speaker_profile_id,
+            request.guide_entry_id, request.session_id,
+        )
+        if request.is_primary:
+            existing = database.scalars(select(SpeakerCharacterAssignment).where(
+                SpeakerCharacterAssignment.speaker_profile_id == speaker.id,
+                SpeakerCharacterAssignment.session_id == request.session_id,
+                SpeakerCharacterAssignment.id != assignment.id,
+            )).all()
+            for other in existing:
+                other.is_primary = False
+        assignment.guide_entry_id = character.id
+        assignment.session_id = request.session_id
+        assignment.is_primary = request.is_primary
+        assignment.notes = request.notes.strip()
+        try:
+            database.commit()
+        except IntegrityError as exc:
+            database.rollback()
+            raise HTTPException(status_code=409, detail="Speaker assignment already exists") from exc
+        database.refresh(assignment)
+        return speaker_assignment_response(assignment, speaker, character, game_session)
+
+    @app.delete(
+        "/api/v1/campaigns/{campaign_id}/speaker-character-assignments/{assignment_id}",
+        status_code=204,
+    )
+    def delete_speaker_character_assignment(
+        campaign_id: uuid.UUID,
+        assignment_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> None:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        assignment = database.scalar(
+            select(SpeakerCharacterAssignment)
+            .join(SpeakerProfile, SpeakerProfile.id == SpeakerCharacterAssignment.speaker_profile_id)
+            .where(
+                SpeakerCharacterAssignment.id == assignment_id,
+                SpeakerProfile.campaign_id == campaign_id,
+            )
+        )
+        if assignment is None:
+            raise HTTPException(status_code=404, detail="Speaker assignment not found")
+        database.delete(assignment)
         database.commit()
 
     @app.get(
@@ -527,6 +1097,111 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Analysis proposal not found")
         return proposal
 
+    def live_diarization(database: Session, session_id: uuid.UUID) -> Artifact | None:
+        return database.scalar(select(Artifact).where(
+            Artifact.session_id == session_id,
+            Artifact.kind == "diarization",
+            Artifact.superseded_at.is_(None),
+        ).order_by(Artifact.created_at.desc()))
+
+    def reviews_of_diarization(diarization_id: uuid.UUID | None):
+        """Reviews describing this diarization's clusters, plus unattributed ones.
+
+        A review with no diarization recorded predates generational diarization or
+        was entered by hand, so it is kept rather than hidden. One belonging to a
+        superseded generation is dropped: its cluster labels have been renumbered,
+        and reusing them would attribute lines to whoever now holds the label.
+        """
+        if diarization_id is None:
+            return SpeakerReview.diarization_artifact_id.is_(None)
+        return (
+            SpeakerReview.diarization_artifact_id.is_(None)
+            | (SpeakerReview.diarization_artifact_id == diarization_id)
+        )
+
+    # Findings from a superseded generation stay in the database for comparison but
+    # must not reach the review queue or any published page. Manually authored
+    # findings have no run and belong to every generation.
+    active_run_findings = (
+        AnalysisProposal.analysis_run_id.is_(None)
+        | (AnalysisProposal.analysis_run_id == GameSession.active_analysis_run_id)
+    )
+
+    def chronicle_entry(
+        database: Session, campaign_id: uuid.UUID, session_id: uuid.UUID, entry_id: uuid.UUID
+    ) -> ChronicleEntry:
+        entry = database.scalar(
+            select(ChronicleEntry)
+            .join(GameSession, GameSession.id == ChronicleEntry.session_id)
+            .where(
+                ChronicleEntry.id == entry_id,
+                ChronicleEntry.session_id == session_id,
+                GameSession.campaign_id == campaign_id,
+            )
+        )
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Chronicle entry not found")
+        return entry
+
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/chronicle",
+        response_model=list[ChronicleEntryResponse],
+        tags=["chronicle"],
+    )
+    def list_chronicle_entries(
+        campaign_id: uuid.UUID, session_id: uuid.UUID,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> list[ChronicleEntry]:
+        membership = require_campaign_role(database, user, campaign_id, {"owner", "gm", "player"})
+        if database.scalar(select(GameSession.id).where(
+            GameSession.id == session_id, GameSession.campaign_id == campaign_id
+        )) is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        statement = select(ChronicleEntry).where(ChronicleEntry.session_id == session_id)
+        if membership.role not in {"owner", "gm"}:
+            statement = statement.where(ChronicleEntry.visibility == "player")
+        return list(database.scalars(statement.order_by(ChronicleEntry.section, ChronicleEntry.position, ChronicleEntry.created_at)))
+
+    @app.put(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/chronicle/{entry_id}",
+        response_model=ChronicleEntryResponse,
+        tags=["chronicle"],
+    )
+    def update_chronicle_entry(
+        campaign_id: uuid.UUID, session_id: uuid.UUID, entry_id: uuid.UUID,
+        request: ChronicleEntryUpdate, user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> ChronicleEntry:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        entry = chronicle_entry(database, campaign_id, session_id, entry_id)
+        entry.section = request.section.strip().casefold()
+        entry.entry_type = request.entry_type.strip().casefold()
+        entry.title = request.title.strip()
+        entry.body = request.body.strip()
+        entry.position = request.position
+        entry.visibility = request.visibility
+        # A hand edit makes this entry the campaign's canon, which is what stops a
+        # later analysis run from overwriting it on approval.
+        entry.edited_at = datetime.now(UTC)
+        database.commit()
+        database.refresh(entry)
+        return entry
+
+    @app.delete(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/chronicle/{entry_id}",
+        status_code=204,
+        tags=["chronicle"],
+    )
+    def delete_chronicle_entry(
+        campaign_id: uuid.UUID, session_id: uuid.UUID, entry_id: uuid.UUID,
+        user: User = Depends(current_user), database: Session = Depends(database_session),
+    ) -> Response:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        entry = chronicle_entry(database, campaign_id, session_id, entry_id)
+        database.delete(entry)
+        database.commit()
+        return Response(status_code=204)
+
     @app.get(
         "/api/v1/campaigns/{campaign_id}/analysis-proposals",
         response_model=list[AnalysisProposalResponse],
@@ -542,7 +1217,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         statement = (
             select(AnalysisProposal)
             .join(GameSession, GameSession.id == AnalysisProposal.session_id)
-            .where(GameSession.campaign_id == campaign_id)
+            .where(GameSession.campaign_id == campaign_id, active_run_findings)
             .order_by(AnalysisProposal.created_at, AnalysisProposal.kind, AnalysisProposal.title)
         )
         if proposal_status is not None:
@@ -567,7 +1242,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         statement = (
             select(AnalysisProposal)
             .join(GameSession, GameSession.id == AnalysisProposal.session_id)
-            .where(AnalysisProposal.session_id == session_id, GameSession.campaign_id == campaign_id)
+            .where(
+                AnalysisProposal.session_id == session_id,
+                GameSession.campaign_id == campaign_id,
+                active_run_findings,
+            )
             .order_by(AnalysisProposal.created_at, AnalysisProposal.kind, AnalysisProposal.title)
         )
         if proposal_status is not None:
@@ -602,7 +1281,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if valid_ids != artifact_ids:
                 raise HTTPException(status_code=422, detail="Evidence must reference this session's artifacts")
         proposal = AnalysisProposal(
-            session_id=session_id, kind=request.kind, title=request.title.strip(),
+            session_id=session_id, kind=request.kind, lane=request.lane, title=request.title.strip(),
             body=request.body.strip(), aliases=request.aliases,
             evidence=[item.model_dump(mode="json") for item in request.evidence],
             confidence=request.confidence, visibility=request.visibility,
@@ -628,10 +1307,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         proposal = analysis_proposal(database, campaign_id, session_id, proposal_id)
         if proposal.status != "proposed":
             raise HTTPException(status_code=409, detail="Reviewed proposals cannot be edited")
+        if proposal.analysis_run_id is not None:
+            # What the model produced is the record of what the model produced.
+            # Review is approve or reject; the wording is edited in the Chronicle,
+            # where an edit is marked as canon instead of quietly rewriting history.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Model findings are immutable. Approve or reject it, then edit the "
+                    "Chronicle entry, which becomes the campaign's canon"
+                ),
+            )
         proposal.title = request.title.strip()
         proposal.body = request.body.strip()
         proposal.aliases = list(dict.fromkeys(a.strip() for a in request.aliases if a.strip()))
         proposal.visibility = request.visibility
+        proposal.lane = request.lane
         database.commit()
         database.refresh(proposal)
         return proposal
@@ -649,7 +1340,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         proposal = analysis_proposal(database, campaign_id, session_id, proposal_id)
         if proposal.status != "proposed":
             raise HTTPException(status_code=409, detail="Proposal was already reviewed")
-        guide_kinds = {"character", "location", "item", "spell", "creature", "quest", "faction", "deity", "rule"}
+        active_run_id = database.scalar(
+            select(GameSession.active_analysis_run_id).where(GameSession.id == session_id)
+        )
+        if proposal.analysis_run_id is not None and proposal.analysis_run_id != active_run_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Finding belongs to a superseded analysis run; activate that run to review it",
+            )
+        # The guide is a dictionary of reusable entities. Quests and rules are
+        # episodic and belong to threads and the table log; spells and the
+        # unclassified "character" bucket were not worth entries of their own.
+        guide_kinds = {
+            "player_character", "npc", "location", "item", "creature", "faction", "deity",
+        }
         if proposal.kind in guide_kinds:
             entry = database.scalar(select(CampaignGuideEntry).where(
                 CampaignGuideEntry.campaign_id == campaign_id,
@@ -665,6 +1369,77 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 database.add(entry)
                 database.flush()
             proposal.promoted_guide_entry_id = entry.id
+            if proposal.body.strip() and database.scalar(select(CampaignGuideFact.id).where(
+                CampaignGuideFact.source_proposal_id == proposal.id
+            )) is None:
+                database.add(CampaignGuideFact(
+                    guide_entry_id=entry.id,
+                    session_id=session_id,
+                    source_proposal_id=proposal.id,
+                    category="session_detail",
+                    value=proposal.body.strip(),
+                    status="canonical",
+                    confidence=proposal.confidence,
+                    visibility=proposal.visibility,
+                    created_by_id=user.id,
+                ))
+        chronicle_sections = {
+            "session_summary": ("recap", "recap"),
+            "scene": ("outline", "scene"),
+            "memorable_moment": ("moments", "memorable_moment"),
+            "player_character": ("entities", "player_character"),
+            "npc": ("entities", "npc"),
+            "creature": ("entities", "creature"),
+            "location": ("entities", "location"),
+            "item": ("entities", "item"),
+            "faction": ("entities", "faction"),
+            "deity": ("entities", "deity"),
+            "important_decision": ("threads", "decision"),
+            "quest": ("threads", "quest"),
+            "unresolved_question": ("threads", "unresolved_question"),
+            "follow_up": ("meta", "follow_up"),
+            "rule": ("meta", "rule"),
+            "table_note": ("meta", "table_note"),
+        }
+        section_type = chronicle_sections.get(proposal.kind)
+        if section_type:
+            section, entry_type = section_type
+            existing = database.scalar(select(ChronicleEntry).where(
+                ChronicleEntry.source_proposal_id == proposal.id
+            ))
+            if existing is None:
+                # Re-analysing a session produces a new finding for the same thing.
+                # Approving it should refresh the Chronicle rather than add a second
+                # entry with the same title, so match on section and title too.
+                existing = database.scalar(select(ChronicleEntry).where(
+                    ChronicleEntry.session_id == session_id,
+                    ChronicleEntry.section == section,
+                    func.lower(ChronicleEntry.title) == proposal.title.casefold(),
+                ))
+            if existing is None:
+                position = database.scalar(select(func.count(ChronicleEntry.id)).where(
+                    ChronicleEntry.session_id == session_id, ChronicleEntry.section == section
+                )) or 0
+                database.add(ChronicleEntry(
+                    session_id=session_id, source_proposal_id=proposal.id,
+                    section=section, entry_type=entry_type, title=proposal.title,
+                    body=proposal.body, position=position, visibility=proposal.visibility,
+                    entry_metadata={"aliases": proposal.aliases, "evidence": proposal.evidence},
+                    created_by_id=user.id,
+                ))
+            elif existing.edited_at is None:
+                # Untouched machine text is safe to replace with the newer finding.
+                existing.source_proposal_id = proposal.id
+                existing.entry_type = entry_type
+                existing.title = proposal.title
+                existing.body = proposal.body
+                existing.visibility = proposal.visibility
+                existing.entry_metadata = {
+                    "aliases": proposal.aliases, "evidence": proposal.evidence,
+                }
+            # An entry a human has edited is the campaign's canon: a later run never
+            # overwrites it. The finding is still approved, and its lineage stays
+            # readable through the run it came from.
         proposal.status = "approved"
         proposal.reviewed_by_id = user.id
         proposal.reviewed_at = datetime.now(UTC)
@@ -739,11 +1514,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ))
         if game_session is None:
             raise HTTPException(status_code=404, detail="Session not found")
-        proposals = list(database.scalars(select(AnalysisProposal).where(
-            AnalysisProposal.session_id == session_id,
-            AnalysisProposal.status == "approved",
-            AnalysisProposal.visibility == "player",
-        ).order_by(AnalysisProposal.created_at)))
+        proposals = list(database.scalars(
+            select(AnalysisProposal)
+            .join(GameSession, GameSession.id == AnalysisProposal.session_id)
+            .where(
+                AnalysisProposal.session_id == session_id,
+                AnalysisProposal.status == "approved",
+                AnalysisProposal.visibility == "player",
+                active_run_findings,
+            )
+            .order_by(AnalysisProposal.created_at)
+        ))
         if not proposals:
             raise HTTPException(status_code=409, detail="Approve at least one player-visible finding first")
         target = request.target_path or default_target_path(game_session)
@@ -964,7 +1745,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             select(Job, GameSession, Campaign)
             .outerjoin(GameSession, GameSession.id == Job.session_id)
             .outerjoin(Campaign, Campaign.id == GameSession.campaign_id)
-            .order_by(Job.status, Job.priority.desc(), Job.created_at)
+            .order_by(
+                case((Job.status == "running", 0), (Job.status == "queued", 1), else_=2),
+                Job.priority.desc(), Job.queue_position, Job.created_at,
+            )
             .limit(500)
         )
         if not user.is_instance_admin:
@@ -977,7 +1761,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         rows = database.execute(statement).all()
         return [QueueJobResponse(
             id=job.id, kind=job.kind, status=job.status, priority=job.priority,
+            queue_position=job.queue_position,
             cancel_requested=job.cancel_requested, attempts=job.attempts, error=job.error,
+            payload=job.payload,
             created_at=job.created_at, updated_at=job.updated_at,
             session_id=game_session.id if game_session else None,
             session_title=game_session.title if game_session else None,
@@ -1003,6 +1789,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         job.updated_at = datetime.now(UTC)
         database.commit()
         database.refresh(job)
+        return job
+
+    @app.post(
+        "/api/v1/jobs/{job_id}/move",
+        response_model=JobResponse,
+        tags=["processing"],
+    )
+    def move_queued_job(
+        job_id: uuid.UUID,
+        request: QueueMoveRequest,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Job:
+        job, _ = manageable_job(database, user, job_id)
+        if job.status != "queued":
+            raise HTTPException(status_code=409, detail="Only queued jobs can be reordered")
+        ordered = list(database.scalars(select(Job).where(
+            Job.status == "queued",
+        ).order_by(Job.priority.desc(), Job.queue_position, Job.created_at, Job.id)))
+        try:
+            current_index = next(index for index, item in enumerate(ordered) if item.id == job.id)
+        except StopIteration as exc:
+            raise HTTPException(status_code=404, detail="Queued job not found") from exc
+        target_index = current_index - 1 if request.direction == "up" else current_index + 1
+        if 0 <= target_index < len(ordered):
+            neighbor = ordered[target_index]
+            job.priority = neighbor.priority
+            ordered.pop(current_index)
+            ordered.insert(target_index, job)
+            now = datetime.now(UTC)
+            for position, item in enumerate(ordered):
+                item.queue_position = position
+                item.updated_at = now
+            database.commit()
+            database.refresh(job)
         return job
 
     @app.post(
@@ -1118,6 +1939,68 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
         return controls
 
+    @app.get(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-runs",
+        response_model=list[AnalysisRunResponse],
+        tags=["analysis-review"],
+    )
+    def list_analysis_runs(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> list[AnalysisRunResponse]:
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        game_session = database.scalar(select(GameSession).where(
+            GameSession.id == session_id, GameSession.campaign_id == campaign_id
+        ))
+        if game_session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        runs = list(database.scalars(select(AnalysisRun).where(
+            AnalysisRun.session_id == session_id
+        ).order_by(AnalysisRun.created_at.desc())))
+        responses = []
+        for run in runs:
+            response = AnalysisRunResponse.model_validate(run)
+            response.is_active = run.id == game_session.active_analysis_run_id
+            responses.append(response)
+        return responses
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-runs/{run_id}/activate",
+        response_model=AnalysisRunResponse,
+        tags=["analysis-review"],
+    )
+    def activate_analysis_run(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        run_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> AnalysisRunResponse:
+        """Choose which generation of findings the session shows.
+
+        Older generations are kept rather than deleted so a disappointing re-analysis
+        can be undone, but only one at a time is reviewable or publishable.
+        """
+        require_campaign_role(database, user, campaign_id, {"owner", "gm"})
+        game_session = database.scalar(select(GameSession).where(
+            GameSession.id == session_id, GameSession.campaign_id == campaign_id
+        ))
+        if game_session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        run = database.scalar(select(AnalysisRun).where(
+            AnalysisRun.id == run_id, AnalysisRun.session_id == session_id
+        ))
+        if run is None:
+            raise HTTPException(status_code=404, detail="Analysis run not found")
+        game_session.active_analysis_run_id = run.id
+        database.commit()
+        database.refresh(run)
+        response = AnalysisRunResponse.model_validate(run)
+        response.is_active = True
+        return response
+
     @app.post(
         "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis",
         response_model=JobResponse,
@@ -1139,6 +2022,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 Artifact.session_id == session_id,
                 GameSession.campaign_id == campaign_id,
                 Artifact.kind.in_({"corrected_transcript", "raw_transcript", "source_transcript", "source_notes"}),
+                Artifact.superseded_at.is_(None),
             )
             .order_by(Artifact.created_at.desc())
         ))
@@ -1151,6 +2035,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             source = min(sources, key=lambda item: priority[item.kind], default=None)
         if source is None:
             raise HTTPException(status_code=409, detail="Add a transcript or notes before analysis")
+        diarization_active = database.scalar(select(Job.id).where(
+            Job.session_id == session_id,
+            Job.kind == "diarization",
+            Job.status.in_({"queued", "running"}),
+        ))
+        if diarization_active is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Diarization is still queued or running; analysis can start after it completes",
+            )
         active = database.scalar(select(Job.id).where(
             Job.session_id == session_id,
             Job.kind == "analysis",
@@ -1163,6 +2057,80 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             artifact_id=source.id,
             kind="analysis",
             payload={"requested_by_id": str(user.id), "source_artifact_id": str(source.id)},
+        )
+        database.add(job)
+        database.commit()
+        database.refresh(job)
+        return job
+
+    @app.post(
+        "/api/v1/campaigns/{campaign_id}/sessions/{session_id}/transcription",
+        response_model=JobResponse,
+        status_code=202,
+        tags=["review"],
+    )
+    def queue_transcription(
+        campaign_id: uuid.UUID,
+        session_id: uuid.UUID,
+        user: User = Depends(current_user),
+        database: Session = Depends(database_session),
+    ) -> Job:
+        """Transcribe the session's audio again, replacing the current transcript.
+
+        Transcription used to be reachable only by uploading audio, so improving a
+        transcript after a guide fix meant re-uploading the recording and living with
+        two source copies. The new transcript supersedes the old one when it lands,
+        not when it is queued, so a failed re-run costs nothing.
+        """
+        require_campaign_role(
+            database, user, campaign_id,
+            {CampaignRole.OWNER.value, CampaignRole.GM.value},
+        )
+        audio = database.scalar(
+            select(Artifact)
+            .join(GameSession, GameSession.id == Artifact.session_id)
+            .where(
+                Artifact.session_id == session_id,
+                Artifact.kind == "source_audio",
+                Artifact.superseded_at.is_(None),
+                GameSession.campaign_id == campaign_id,
+            )
+            .order_by(Artifact.created_at.desc())
+        )
+        if audio is None:
+            raise HTTPException(
+                status_code=409, detail="Upload session audio before transcribing"
+            )
+        # Diarization and analysis both read the transcript, so replacing it under a
+        # running job would leave that job working from a generation nobody can see.
+        blocking = database.scalar(
+            select(Job.kind).where(
+                Job.session_id == session_id,
+                Job.kind.in_(["transcription", "diarization", "analysis"]),
+                Job.status.in_(["queued", "running"]),
+            )
+        )
+        if blocking is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A {blocking} job for this session is already queued or running",
+            )
+        previous = database.scalar(
+            select(Artifact.id).where(
+                Artifact.session_id == session_id,
+                Artifact.kind == "raw_transcript",
+                Artifact.superseded_at.is_(None),
+            ).order_by(Artifact.created_at.desc())
+        )
+        job = Job(
+            session_id=session_id,
+            artifact_id=audio.id,
+            kind="transcription",
+            status="queued",
+            payload={
+                "artifact_id": str(audio.id),
+                **({"replaces_artifact_id": str(previous)} if previous else {}),
+            },
         )
         database.add(job)
         database.commit()
@@ -1193,6 +2161,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .where(
                 Artifact.session_id == session_id,
                 Artifact.kind == "normalized_audio",
+                Artifact.superseded_at.is_(None),
                 GameSession.campaign_id == campaign_id,
             )
             .order_by(Artifact.created_at.desc())
@@ -1202,29 +2171,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=409,
                 detail="Transcription must finish before diarization can be queued",
             )
-        existing_artifact = database.scalar(
-            select(Artifact.id).where(
-                Artifact.session_id == session_id,
-                Artifact.kind == "diarization",
-            )
-        )
-        if existing_artifact is not None:
-            raise HTTPException(status_code=409, detail="This session is already diarized")
-        existing_job = database.scalar(
-            select(Job.id).where(
+        # Re-diarizing used to be refused outright once a session had a diarization,
+        # which left a bad clustering permanently in place. It is allowed now: the
+        # result supersedes the previous one when it lands, and reviews stay with the
+        # generation whose clusters they describe.
+        blocking = database.scalar(
+            select(Job.kind).where(
                 Job.session_id == session_id,
-                Job.kind == "diarization",
+                Job.kind.in_(["transcription", "diarization", "analysis"]),
                 Job.status.in_(["queued", "running"]),
             )
         )
-        if existing_job is not None:
-            raise HTTPException(status_code=409, detail="Diarization is already queued")
+        if blocking is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A {blocking} job for this session is already queued or running",
+            )
+        previous = live_diarization(database, session_id)
         job = Job(
             session_id=session_id,
             artifact_id=normalized.id,
             kind="diarization",
             status="queued",
-            payload={"normalized_audio_artifact_id": str(normalized.id)},
+            payload={
+                "normalized_audio_artifact_id": str(normalized.id),
+                **({"replaces_artifact_id": str(previous.id)} if previous else {}),
+            },
         )
         database.add(job)
         database.commit()
@@ -1266,12 +2238,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             campaign_id,
             {CampaignRole.OWNER.value, CampaignRole.GM.value},
         )
+        diarization = live_diarization(database, session_id)
         reviews = database.scalars(
             select(SpeakerReview)
             .join(GameSession, GameSession.id == SpeakerReview.session_id)
             .where(
                 SpeakerReview.session_id == session_id,
                 GameSession.campaign_id == campaign_id,
+                reviews_of_diarization(diarization.id if diarization else None),
             )
             .order_by(SpeakerReview.cluster_label, SpeakerReview.start_seconds)
         ).all()
@@ -1323,8 +2297,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=422,
                 detail="A reference clip must have a confirmed speaker",
             )
+        diarization = live_diarization(database, session_id)
         review = SpeakerReview(
             session_id=session_id,
+            diarization_artifact_id=diarization.id if diarization else None,
             cluster_label=request.cluster_label.strip(),
             start_seconds=request.start_seconds,
             end_seconds=request.end_seconds,
@@ -1447,11 +2423,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             diarization = database.scalar(select(Artifact).where(
                 Artifact.session_id == session_id,
                 Artifact.kind == "diarization",
+                Artifact.superseded_at.is_(None),
             ).order_by(Artifact.created_at.desc()))
             if diarization is not None:
                 diarization_content = read_artifact(resolved, diarization)
                 reviews = list(database.scalars(select(SpeakerReview).where(
                     SpeakerReview.session_id == session_id,
+                    reviews_of_diarization(diarization.id),
                 )))
                 content = dict(content)
                 content["segments"] = attribute_transcript_segments(
@@ -1480,6 +2458,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .where(
                 Artifact.session_id == session_id,
                 Artifact.kind.in_(["raw_transcript", "corrected_transcript"]),
+                Artifact.superseded_at.is_(None),
             )
             .order_by(Artifact.created_at.desc())
         )
@@ -1577,6 +2556,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .where(
                 Artifact.session_id == session_id,
                 Artifact.kind == "normalized_audio",
+                Artifact.superseded_at.is_(None),
                 GameSession.campaign_id == campaign_id,
             )
             .order_by(Artifact.created_at.desc())

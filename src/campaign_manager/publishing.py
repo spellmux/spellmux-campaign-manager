@@ -20,18 +20,24 @@ def default_target_path(game_session: GameSession) -> str:
 
 def render_player_draft(game_session: GameSession, proposals: list[AnalysisProposal]) -> str:
     summaries = [item for item in proposals if item.kind == "session_summary"]
+    # Recap first, then what happened, then the entities involved: the order a
+    # player reads. Kinds absent here are deliberately unpublished — table notes and
+    # follow-ups are GM logistics, not story. Every kind that exists must appear in
+    # exactly one section, or approved findings vanish from the page without a trace.
     sections = {
-        "important_decision": "Important decisions",
-        "quest": "Quests",
-        "character": "Characters",
+        "scene": "What happened",
+        "memorable_moment": "Memorable moments",
+        "player_character": "Player characters",
+        "npc": "Characters",
+        "creature": "Creatures",
         "location": "Locations",
         "item": "Items",
-        "spell": "Spells",
-        "creature": "Creatures",
         "faction": "Factions",
         "deity": "Deities",
-        "rule": "Rules and rulings",
+        "quest": "Quests",
+        "important_decision": "Important decisions",
         "unresolved_question": "Open questions",
+        "rule": "Rules and rulings",
     }
     lines = [f"# {game_session.title}"]
     if game_session.session_date:

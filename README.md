@@ -15,6 +15,7 @@ player recaps.
 - performs optional local speaker diarization with pyannote.audio;
 - lets a GM validate speaker clusters and maintain campaign-wide speaker identities;
 - analyzes sessions locally with Ollama and produces evidence-backed review proposals;
+- routes analysis to administrator-managed compute workers with priority and fallback;
 - separates GM-only findings from player-visible material;
 - maintains a canonical Campaign Guide for names, locations, characters, items, and lore;
 - generates versioned player-session drafts and publishes approved Markdown to OtterWiki;
@@ -31,8 +32,19 @@ The application uses FastAPI, PostgreSQL, and separate background workers. Optio
 provide faster-whisper transcription, pyannote diarization, and Ollama analysis. Docker Compose
 is the portable reference deployment; Unraid is a supported deployment target.
 
+Instance administrators can register Ollama-compatible endpoints under **Compute Workers**.
+Endpoints may run in the bundled Docker network or on another LAN machine; URLs, models,
+capabilities, and routing priority are stored as deployment configuration rather than source
+code. The bundled Ollama service remains the fallback when no managed analysis worker is ready.
+Ollama endpoints do not authenticate local API calls, so restrict them with host firewalls and
+never publish their ports through an internet-facing reverse proxy.
+
 See [the architecture guide](docs/architecture.md), [product specification](docs/product-spec.md),
-and [Unraid deployment notes](deploy/unraid/README.md) for more detail.
+[remote compute layout](docs/remote-compute.md),
+[local models and hardware roadmap](docs/models-and-hardware.md),
+[Planning Studio roadmap](docs/planning-studio.md),
+[processing-workflow roadmap](docs/processing-workflows.md), and
+[Unraid deployment notes](deploy/unraid/README.md) for more detail.
 
 ## Quick start with Docker Compose
 
@@ -68,6 +80,19 @@ python -m pip install -e ".[dev]"
 python -m pytest
 python -m ruff check .
 ```
+
+Frontend changes require Node 22 or newer. Build the typed Preact assets into the Python
+package before running the server from a source checkout:
+
+```bash
+cd frontend
+npm ci
+npm run check
+npm run build:package
+```
+
+Docker performs this frontend build automatically; Node is not installed in the final runtime
+image.
 
 Useful local entry points are `campaign-server`, `campaign-worker`, and `campaignctl doctor`.
 

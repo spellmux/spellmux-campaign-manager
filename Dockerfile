@@ -1,3 +1,11 @@
+FROM node:22-alpine AS frontend
+
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend ./
+RUN npm run check && npm run build
+
 FROM python:3.12-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -16,6 +24,7 @@ RUN apt-get update \
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY --from=frontend /frontend/dist ./src/campaign_manager/static/assets
 COPY alembic.ini ./
 COPY migrations ./migrations
 RUN python -m pip install --no-cache-dir .
@@ -29,6 +38,7 @@ FROM base AS test
 USER root
 RUN python -m pip install --no-cache-dir ".[dev]"
 COPY tests ./tests
+COPY compose.yml ./compose.yml
 CMD ["pytest", "-q"]
 
 FROM base AS runtime

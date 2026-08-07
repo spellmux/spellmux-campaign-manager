@@ -3,7 +3,7 @@ from test_auth_campaigns import configured_client, create_campaign_and_session, 
 
 def create_proposal(client, headers, campaign_id, session_id, **overrides):
     payload = {
-        "kind": "character",
+        "kind": "npc",
         "title": "Caelen",
         "body": "A traveler caught between worlds.",
         "aliases": ["Kalen"],
@@ -55,7 +55,7 @@ def test_proposal_can_be_edited_approved_and_promoted(tmp_path) -> None:
     assert approved.json()["promoted_guide_entry_id"] is not None
 
     guide = client.get(f"/api/v1/campaigns/{campaign_id}/guide", headers=headers).json()
-    assert [(entry["kind"], entry["canonical_name"]) for entry in guide] == [("character", "Caelen")]
+    assert [(entry["kind"], entry["canonical_name"]) for entry in guide] == [("npc", "Caelen")]
     assert guide[0]["notes"] == "An elven traveler caught between worlds."
     assert client.put(
         f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-proposals/{proposal['id']}",
@@ -71,7 +71,7 @@ def test_approval_links_exact_guide_match_without_overwriting_and_summary_stays_
     existing = client.post(
         f"/api/v1/campaigns/{campaign_id}/guide",
         headers=headers,
-        json={"kind": "character", "canonical_name": "Caelen", "aliases": [], "notes": "Curated truth", "visibility": "gm"},
+        json={"kind": "npc", "canonical_name": "Caelen", "aliases": [], "notes": "Curated truth", "visibility": "gm"},
     ).json()
     duplicate = create_proposal(client, headers, campaign_id, session_id).json()
     approved = client.post(
@@ -120,3 +120,65 @@ def test_proposal_can_be_rejected_and_filtered(tmp_path) -> None:
         f"/api/v1/campaigns/{campaign_id}/sessions/{session_id}/analysis-proposals/{proposal['id']}/approve",
         headers=headers,
     ).status_code == 409
+
+
+def test_guide_entry_accumulates_knowledge_and_sessions_it_was_encountered_in(tmp_path) -> None:
+    # A guide entity is a planning reference: what is known about it, and which
+    # sessions it turned up in. The sessions come from approved facts, so they are
+    # never model-authored and cannot drift from the findings behind them.
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign_id, first_session = create_campaign_and_session(client, headers)
+    second_session = client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions",
+        headers=headers,
+        json={"title": "Down the Rabbit Hole", "session_date": "2026-08-07"},
+    ).json()["id"]
+
+    first = create_proposal(
+        client, headers, campaign_id, first_session,
+        kind="creature", title="Mock Turtle", aliases=["Mock Turtles"],
+        body="Melancholy shelled beasts; the party learned their song calms them.",
+    ).json()
+    client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{first_session}/analysis-proposals/{first['id']}/approve",
+        headers=headers,
+    )
+    later = create_proposal(
+        client, headers, campaign_id, second_session,
+        kind="creature", title="Mock Turtle", aliases=[],
+        body="They cannot cross running water.",
+    ).json()
+    client.post(
+        f"/api/v1/campaigns/{campaign_id}/sessions/{second_session}/analysis-proposals/{later['id']}/approve",
+        headers=headers,
+    )
+
+    guide = client.get(f"/api/v1/campaigns/{campaign_id}/guide", headers=headers).json()
+    assert len(guide) == 1
+    entry = guide[0]
+    assert entry["kind"] == "creature"
+    assert entry["fact_count"] == 2
+    # Chronological, so the entry reads as an encounter history.
+    assert [(s["title"], s["fact_count"]) for s in entry["sessions"]] == [
+        ("Arrival at the Crossroads", 1),
+        ("Down the Rabbit Hole", 1),
+    ]
+    assert [s["session_id"] for s in entry["sessions"]] == [first_session, second_session]
+
+    facts = client.get(
+        f"/api/v1/campaigns/{campaign_id}/guide/{entry['id']}/facts", headers=headers
+    ).json()
+    assert [fact["value"] for fact in facts] == [
+        "Melancholy shelled beasts; the party learned their song calms them.",
+        "They cannot cross running water.",
+    ]
+
+    # Searching by a mishearing has to find the entry, since an alias is usually
+    # the mishearing itself.
+    assert [e["canonical_name"] for e in client.get(
+        f"/api/v1/campaigns/{campaign_id}/guide?search=mock+turtles", headers=headers
+    ).json()] == ["Mock Turtle"]
+    assert client.get(
+        f"/api/v1/campaigns/{campaign_id}/guide?kind=npc", headers=headers
+    ).json() == []

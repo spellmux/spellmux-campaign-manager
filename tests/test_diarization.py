@@ -5,9 +5,13 @@ from types import SimpleNamespace
 import pytest
 
 from campaign_manager.diarization import (
+    DiarizationResult,
     _load_pcm_wav,
+    _speaker_centroids,
+    as_diarization_result,
     attribute_transcript_segments,
     cluster_resolutions,
+    load_pcm_wav_window,
     representative_clips,
 )
 
@@ -109,3 +113,61 @@ def test_load_pcm_wav_returns_in_memory_waveform(tmp_path) -> None:
 
     assert audio["sample_rate"] == 16_000
     assert tuple(audio["waveform"].shape) == (1, 160)
+
+
+def test_diarization_retains_voice_centroids_for_enrollment() -> None:
+    class FakeAnnotation:
+        def labels(self):
+            return ["SPEAKER_00", "SPEAKER_01", "SPEAKER_02"]
+
+    # pyannote zero-pads when it finds fewer centroids than speakers.
+    output = SimpleNamespace(
+        speaker_diarization=FakeAnnotation(),
+        speaker_embeddings=[[0.1, 0.2], [0.3, 0.4], [0.0, 0.0]],
+    )
+
+    centroids = _speaker_centroids(output)
+
+    assert centroids == {"SPEAKER_00": [0.1, 0.2], "SPEAKER_01": [0.3, 0.4]}
+
+
+def test_diarization_accepts_adapters_that_return_only_turns() -> None:
+    # Existing providers yield plain tuples; centroids are an optional enrichment.
+    plain = as_diarization_result([(0.0, 1.0, "SPEAKER_00"), (1.0, 2.0, "SPEAKER_01")])
+    assert plain.turns == [(0.0, 1.0, "SPEAKER_00"), (1.0, 2.0, "SPEAKER_01")]
+    assert plain.embeddings == {}
+
+    enriched = DiarizationResult(
+        turns=[(0.0, 1.0, "SPEAKER_00")],
+        embeddings={"SPEAKER_00": [1.0, 0.0]},
+        embedding_model="pyannote/speaker-diarization-community-1",
+    )
+    assert as_diarization_result(enriched) is enriched
+
+
+def test_wav_window_reads_only_the_requested_clip(tmp_path) -> None:
+    pytest.importorskip("torch")
+    import struct
+
+    path = tmp_path / "normalized.wav"
+    sample_rate = 16_000
+    with wave.open(str(path), "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(sample_rate)
+        # Three seconds: 0s silence, 1s loud, 2s silence.
+        frames = [0] * sample_rate + [12_000] * sample_rate + [0] * sample_rate
+        target.writeframes(struct.pack(f"<{len(frames)}h", *frames))
+
+    window = load_pcm_wav_window(path, 1.0, 2.0)
+
+    assert window["sample_rate"] == sample_rate
+    assert window["waveform"].shape == (1, sample_rate)
+    # Only the loud second was read, not the whole file.
+    assert float(window["waveform"].abs().mean()) > 0.3
+
+    clamped = load_pcm_wav_window(path, 2.5, 99.0)
+    assert clamped["waveform"].shape[1] == sample_rate // 2
+
+    with pytest.raises(ValueError, match="empty"):
+        load_pcm_wav_window(path, 3.0, 3.0)

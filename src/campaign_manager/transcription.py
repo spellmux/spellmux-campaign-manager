@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from campaign_manager.artifacts import supersede_previous_artifacts
 from campaign_manager.config import Settings
 from campaign_manager.models import (
     Artifact,
@@ -24,10 +25,55 @@ from campaign_manager.models import (
     SessionStatus,
 )
 
-Transcribe = Callable[[Path, str], dict[str, Any]]
+# hotwords is optional so an adapter that ignores it keeps working.
+Transcribe = Callable[..., dict[str, Any]]
+# Normalization shells out to ffmpeg, which is deliberately absent from the test
+# image; injecting it lets the job's artifact bookkeeping be tested without it.
+Normalize = Callable[[Path, Path], None]
+
+# Whisper's decoder reserves about 224 tokens for the prompt, and the initial
+# prompt and hotwords share it. Roughly four characters per token, halved so
+# either one alone cannot fill the window.
+PROMPT_BUDGET_CHARS = 400
 
 
-def build_initial_prompt(entries: Iterable[CampaignGuideEntry], limit: int = 4_000) -> str:
+def build_hotwords(entries: Iterable[CampaignGuideEntry], limit: int = PROMPT_BUDGET_CHARS) -> str:
+    """Build a bounded proper-noun bias applied across the whole recording.
+
+    initial_prompt only conditions the opening window and then drifts, which is
+    why canonical names still came back misheard late in a session: one character
+    accumulated six phonetic spellings in the guide, and an inn was transcribed
+    with the wrong name. Hotwords keep the bias active throughout.
+    """
+    # Whisper's prompt window is small, so the budget is spent most-spoken first.
+    # Ordering the guide by kind alphabetically put player characters near the end
+    # and truncated them out entirely, which are the names said most often and the
+    # ones that had accumulated the most misspellings.
+    priority = {
+        "player_character": 0, "npc": 1, "location": 2,
+        "faction": 3, "deity": 4, "creature": 5, "item": 6,
+    }
+    ordered = sorted(entries, key=lambda entry: (priority.get(entry.kind, 99), entry.canonical_name))
+    names: list[str] = []
+    for entry in ordered:
+        # Aliases are usually the mishearing itself, so boosting them would
+        # reinforce the error; only the canonical spelling is reinforced.
+        name = str(entry.canonical_name).strip()
+        if name and name not in names:
+            names.append(name)
+    selected: list[str] = []
+    used = 0
+    for name in names:
+        if used + len(name) + 2 > limit:
+            break
+        selected.append(name)
+        used += len(name) + 2
+    return ", ".join(selected)
+
+
+def build_initial_prompt(
+    entries: Iterable[CampaignGuideEntry], limit: int = PROMPT_BUDGET_CHARS
+) -> str:
     """Build a bounded campaign-specific spelling and context hint for Whisper."""
     lines = ["Dungeons & Dragons campaign transcript. Use these canonical terms:"]
     for entry in entries:
@@ -47,6 +93,7 @@ def process_transcription_job(
     settings: Settings,
     job: Job,
     transcribe: Transcribe | None = None,
+    normalize: Normalize | None = None,
 ) -> None:
     if job.artifact_id is None or job.session_id is None:
         raise ValueError("Transcription job requires an artifact and session")
@@ -63,7 +110,13 @@ def process_transcription_job(
         )
         .order_by(CampaignGuideEntry.kind, CampaignGuideEntry.canonical_name)
     ).all()
-    prompt = build_initial_prompt(guide)
+    # Whisper's prompt window is roughly 224 tokens and holds the initial prompt
+    # and the hotwords together. Exceeding it fails outright with a position
+    # encoding error rather than truncating, so both are bounded to share it.
+    # Hotwords get the canonical names because they stay active for the whole
+    # recording, leaving the prompt to supply brief framing.
+    prompt = build_initial_prompt(guide, limit=PROMPT_BUDGET_CHARS)
+    hotwords = build_hotwords(guide, limit=PROMPT_BUDGET_CHARS)
     source_path = _contained_path(settings.artifact_root, source.relative_path)
     output_dir = Path(str(game_session.campaign_id)) / str(game_session.id)
     normalized_relative = output_dir / "normalized" / f"{job.id}.wav"
@@ -77,15 +130,18 @@ def process_transcription_job(
     database.commit()
     created_paths: list[Path] = []
     try:
-        _normalize_audio(source_path, normalized_path)
+        (normalize or _normalize_audio)(source_path, normalized_path)
         created_paths.append(normalized_path)
-        result = (transcribe or _faster_whisper_transcriber(settings))(normalized_path, prompt)
+        result = (transcribe or _faster_whisper_transcriber(settings))(
+            normalized_path, prompt, hotwords
+        )
         result.update(
             {
                 "schema_version": 1,
                 "source_artifact_id": str(source.id),
                 "normalized_audio_artifact_kind": "normalized_audio",
                 "campaign_prompt": prompt,
+                "campaign_hotwords": hotwords,
             }
         )
         _write_json_atomic(transcript_path, result)
@@ -102,6 +158,22 @@ def process_transcription_job(
             "application/json",
         )
         database.add_all((normalized_artifact, transcript_artifact))
+        database.flush()
+        # A re-transcription replaces the previous result rather than leaving two
+        # live transcripts with nothing to say which one counts.
+        retired = [
+            *supersede_previous_artifacts(
+                database, game_session.id, "normalized_audio", normalized_artifact.id
+            ),
+            *supersede_previous_artifacts(
+                database, game_session.id, "raw_transcript", transcript_artifact.id
+            ),
+        ]
+        if retired:
+            job.payload = {
+                **job.payload,
+                "superseded_artifact_ids": [str(artifact.id) for artifact in retired],
+            }
         game_session.status = SessionStatus.REVIEW.value
         database.commit()
     except Exception:
@@ -114,9 +186,27 @@ def process_transcription_job(
 
 
 def _contained_path(root: Path, relative: str | Path) -> Path:
-    root = root.resolve()
-    candidate = (root / relative).resolve()
-    if not candidate.is_relative_to(root):
+    """Join a relative artifact path to the root, refusing anything that escapes.
+
+    Containment is checked without touching the filesystem first, because a UNC
+    artifact root makes resolve() a network call: it fails with an opaque
+    "user name or password is incorrect" when the share is not authenticated in
+    the current session, which would otherwise surface as that error on every
+    job rather than as an unreachable artifact root.
+    """
+    combined = Path(os.path.normpath(root / relative))
+    normalized_root = Path(os.path.normpath(root))
+    if combined != normalized_root and not combined.is_relative_to(normalized_root):
+        raise ValueError("Artifact path escapes the configured artifact root")
+    try:
+        resolved_root = root.resolve()
+        candidate = (root / relative).resolve()
+    except OSError as exc:
+        raise OSError(
+            f"Artifact root {root} is not reachable from this session: {exc}"
+        ) from exc
+    # Re-check after resolution so a symlink cannot lead outside the root.
+    if candidate != resolved_root and not candidate.is_relative_to(resolved_root):
         raise ValueError("Artifact path escapes the configured artifact root")
     return candidate
 
@@ -149,10 +239,11 @@ def _faster_whisper_transcriber(settings: Settings) -> Transcribe:
         str(settings.model_root),
     )
 
-    def transcribe(audio_path: Path, prompt: str) -> dict[str, Any]:
+    def transcribe(audio_path: Path, prompt: str, hotwords: str = "") -> dict[str, Any]:
         segments, info = model.transcribe(
             str(audio_path),
             initial_prompt=prompt,
+            hotwords=hotwords or None,
             vad_filter=True,
             word_timestamps=True,
         )

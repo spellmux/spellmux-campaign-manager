@@ -27,13 +27,30 @@ class Settings:
     diarization_provider: str = "disabled"
     diarization_model: str = "pyannote/speaker-diarization-community-1"
     diarization_device: str = "cpu"
+    speaker_embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
+    speaker_match_threshold: float = 0.70
+    speaker_match_margin: float = 0.10
     huggingface_token: str | None = None
     analysis_provider: str = "disabled"
     analysis_model: str = "qwen3:4b"
     analysis_base_url: str = "http://ollama:11434"
     analysis_timeout_seconds: int = 21_600
     analysis_max_input_chars: int = 240_000
-    analysis_context_tokens: int = 65_536
+    # Measured on an 8 GB card holding a 4B model at q8_0, with the desktop using
+    # 2 GB: 16k context left 100% of the model on the GPU, 32k also 100%, and 48k
+    # spilled 15% to the CPU and halved output throughput. Chunks sized to fill 32k
+    # cut a 28-chunk session to 8 and its extraction from 14 minutes to under 4,
+    # with no truncation. The fixed rules and guide prefix costs about 7,000
+    # characters per chunk, so a small chunk spends most of its budget on
+    # boilerplate rather than transcript.
+    analysis_context_tokens: int = 32_768
+    analysis_max_output_tokens: int = 4_096
+    analysis_chunk_chars: int = 32_000
+    analysis_chunk_overlap_segments: int = 8
+    # Ollama holds a model in VRAM for 5 minutes by default. On a single card
+    # shared with transcription and image generation that blocks the next
+    # stage, so the model is released sooner than the gap between chunks.
+    analysis_keep_alive_seconds: int = 60
     otterwiki_repository_path: Path | None = None
 
     @classmethod
@@ -62,13 +79,29 @@ class Settings:
                 "pyannote/speaker-diarization-community-1",
             ),
             diarization_device=os.getenv("CAMPAIGN_DIARIZATION_DEVICE", "cpu"),
+            speaker_embedding_model=os.getenv(
+                "CAMPAIGN_SPEAKER_EMBEDDING_MODEL",
+                "pyannote/wespeaker-voxceleb-resnet34-LM",
+            ),
+            speaker_match_threshold=_float_environment("CAMPAIGN_SPEAKER_MATCH_THRESHOLD", 0.70),
+            speaker_match_margin=_float_environment("CAMPAIGN_SPEAKER_MATCH_MARGIN", 0.10),
             huggingface_token=os.getenv("CAMPAIGN_HUGGINGFACE_TOKEN") or None,
             analysis_provider=os.getenv("CAMPAIGN_ANALYSIS_PROVIDER", "disabled"),
             analysis_model=os.getenv("CAMPAIGN_ANALYSIS_MODEL", "qwen3:4b"),
             analysis_base_url=os.getenv("CAMPAIGN_ANALYSIS_BASE_URL", "http://ollama:11434").rstrip("/"),
             analysis_timeout_seconds=_integer_environment("CAMPAIGN_ANALYSIS_TIMEOUT_SECONDS", 21_600),
             analysis_max_input_chars=_integer_environment("CAMPAIGN_ANALYSIS_MAX_INPUT_CHARS", 240_000),
-            analysis_context_tokens=_integer_environment("CAMPAIGN_ANALYSIS_CONTEXT_TOKENS", 65_536),
+            analysis_context_tokens=_integer_environment("CAMPAIGN_ANALYSIS_CONTEXT_TOKENS", 32_768),
+            analysis_max_output_tokens=_integer_environment(
+                "CAMPAIGN_ANALYSIS_MAX_OUTPUT_TOKENS", 4_096
+            ),
+            analysis_chunk_chars=_integer_environment("CAMPAIGN_ANALYSIS_CHUNK_CHARS", 32_000),
+            analysis_chunk_overlap_segments=_integer_environment(
+                "CAMPAIGN_ANALYSIS_CHUNK_OVERLAP_SEGMENTS", 8
+            ),
+            analysis_keep_alive_seconds=_integer_environment(
+                "CAMPAIGN_ANALYSIS_KEEP_ALIVE_SECONDS", 60
+            ),
             otterwiki_repository_path=(
                 Path(value) if (value := os.getenv("CAMPAIGN_OTTERWIKI_REPOSITORY_PATH")) else None
             ),
@@ -95,6 +128,9 @@ class Settings:
             "diarization_provider": self.diarization_provider,
             "diarization_model": self.diarization_model,
             "diarization_device": self.diarization_device,
+            "speaker_embedding_model": self.speaker_embedding_model,
+            "speaker_match_threshold": self.speaker_match_threshold,
+            "speaker_match_margin": self.speaker_match_margin,
             "huggingface_token_configured": bool(self.huggingface_token),
             "analysis_provider": self.analysis_provider,
             "analysis_model": self.analysis_model,
@@ -102,9 +138,23 @@ class Settings:
             "analysis_timeout_seconds": self.analysis_timeout_seconds,
             "analysis_max_input_chars": self.analysis_max_input_chars,
             "analysis_context_tokens": self.analysis_context_tokens,
+            "analysis_max_output_tokens": self.analysis_max_output_tokens,
+            "analysis_chunk_chars": self.analysis_chunk_chars,
+            "analysis_chunk_overlap_segments": self.analysis_chunk_overlap_segments,
+            "analysis_keep_alive_seconds": self.analysis_keep_alive_seconds,
             "otterwiki_publishing_configured": self.otterwiki_repository_path is not None,
             "log_level": self.log_level,
         }
+
+
+def _float_environment(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
 
 
 def _integer_environment(name: str, default: int) -> int:

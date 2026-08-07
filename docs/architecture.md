@@ -42,3 +42,16 @@ or published material.
 - OtterWiki is a publisher adapter, not a runtime dependency.
 - Unraid-specific deployment consists of defaults, documentation, and a template.
 
+## Compute workers
+
+The application server and durable queue remain attached to PostgreSQL and artifact storage.
+Compute endpoints are administrator-managed records that advertise a provider, capabilities,
+model, priority, enabled state, and concurrency limit. An analysis dispatcher selects the
+highest-priority healthy Ollama-compatible endpoint and records the selected worker and model
+in job metadata. If no managed endpoint is healthy, the environment-configured bundled Ollama
+service is retained as a fallback.
+
+This boundary is platform-neutral: an endpoint may be a sibling container, Windows workstation,
+Linux GPU host, Apple Silicon system, or another compatible appliance. Future transcription,
+diarization, and image adapters will use the same worker registry without making remote compute
+a requirement for the all-in-one deployment.

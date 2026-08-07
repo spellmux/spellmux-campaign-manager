@@ -6,6 +6,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 data/
+/campaign_*.zip
 dist/
 build/
 *.egg-info/
+frontend/node_modules/
+frontend/dist/
+src/campaign_manager/static/assets/*
+!src/campaign_manager/static/assets/.gitkeep

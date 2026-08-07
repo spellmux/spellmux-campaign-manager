@@ -17,15 +17,18 @@ what becomes visible to players or is published externally.
 ## Core workflow
 
 1. A GM uploads an audio recording to a campaign session.
-2. A background worker normalizes and transcribes the recording locally.
-3. Diarization proposes speaker turns; the GM assigns and corrects identities.
-4. The Campaign Guide supplies canonical names, aliases, pronunciations, typed
+2. The GM chooses a processing preset, from source storage through a full unattended workflow.
+3. Background workers normalize and transcribe the recording locally, then optionally launch
+   diarization automatically.
+4. Diarization proposes speaker turns; the GM assigns and corrects identities, either before
+   analysis through a review gate or afterward when using unattended processing.
+5. The Campaign Guide supplies canonical names, aliases, pronunciations, typed
    campaign knowledge, and GM coaching.
-5. A local language model proposes recaps, scenes, characters, locations, items,
+6. A local language model proposes recaps, scenes, characters, locations, items,
    spells, factions, quests, and entity changes.
-6. All proposals begin as GM-only drafts.
-7. The GM approves player-visible content.
-8. Approved content appears in the player portal and may be published through a
+7. All proposals begin as GM-only drafts.
+8. The GM approves player-visible content.
+9. Approved content appears in the player portal and may be published through a
    configured adapter such as OtterWiki or generic Git/Markdown.
 
 ## Privacy invariants
@@ -63,3 +66,11 @@ what becomes visible to players or is published externally.
 - Real-time recording or transcription
 - Tactical map generation guarantees
 - Unrestricted host or Unraid administration through MCP
+
+## Future GM planning
+
+The future GM-only Planning Studio will use approved campaign context to propose encounters,
+story beats, session outlines, entities, and other preparation material without treating drafts
+as canon. It will also provide deterministic and optional model-assisted name generation with
+campaign naming profiles, collision detection, reservations, and explicit promotion into entity
+drafts. See [the Planning Studio roadmap](planning-studio.md).

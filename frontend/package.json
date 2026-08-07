@@ -1,0 +1,20 @@
+{
+  "name": "spellmux-campaign-manager-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "build:package": "vite build --outDir ../src/campaign_manager/static/assets",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "preact": "10.29.8"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "2.10.6",
+    "@types/node": "26.1.2",
+    "typescript": "7.0.2",
+    "vite": "8.2.0"
+  }
+}

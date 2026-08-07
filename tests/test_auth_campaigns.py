@@ -1,5 +1,6 @@
 import json
 import uuid
+from functools import lru_cache
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -10,6 +11,14 @@ from campaign_manager.config import Settings
 from campaign_manager.database import configure_database, session_factory
 from campaign_manager.models import Artifact, Base, GameSession, Job, ProcessingControl, User
 
+TEST_PASSWORD = "correct horse battery staple"
+
+
+@lru_cache(maxsize=1)
+def _test_password_hash() -> str:
+    """Hash the fixed test password once; Argon2 is deliberately slow."""
+    return hash_password(TEST_PASSWORD)
+
 
 def configured_client(tmp_path) -> TestClient:
     engine = configure_database(f"sqlite:///{tmp_path / 'test.db'}")
@@ -19,7 +28,7 @@ def configured_client(tmp_path) -> TestClient:
             User(
                 email="gm@example.test",
                 display_name="Game Master",
-                password_hash=hash_password("correct horse battery staple"),
+                password_hash=_test_password_hash(),
                 is_instance_admin=True,
             )
         )
@@ -47,7 +56,7 @@ def configured_client(tmp_path) -> TestClient:
 def login(client: TestClient) -> str:
     response = client.post(
         "/api/v1/auth/login",
-        json={"email": "GM@Example.Test", "password": "correct horse battery staple"},
+        json={"email": "GM@Example.Test", "password": TEST_PASSWORD},
     )
     assert response.status_code == 200
     assert response.json()["token_type"] == "bearer"
@@ -97,6 +106,34 @@ def test_campaign_owner_can_create_and_list_campaign(tmp_path) -> None:
     assert created.json()["role"] == "owner"
     assert listed.status_code == 200
     assert listed.json() == [created.json()]
+
+
+def test_campaign_owner_can_update_campaign_settings(tmp_path) -> None:
+    client = configured_client(tmp_path)
+    headers = {"Authorization": f"Bearer {login(client)}"}
+    campaign = client.post("/api/v1/campaigns", headers=headers, json={"name": "Wonderland"}).json()
+
+    response = client.put(
+        f"/api/v1/campaigns/{campaign['id']}",
+        headers=headers,
+        json={
+            "name": "Wonderland After Dark",
+            "description": "Thursday night campaign",
+            "game_system": "D&D 5.5",
+            "play_mode": "in-person",
+            "vtt": "Foundry VTT",
+            "character_source": "D&D Beyond",
+            "notes": "Rolls are physical and the VTT is mainly used for maps.",
+        },
+    )
+
+    assert response.status_code == 200
+    updated = response.json()
+    assert updated["name"] == "Wonderland After Dark"
+    assert updated["game_system"] == "D&D 5.5"
+    assert updated["play_mode"] == "in_person"
+    assert updated["vtt"] == "Foundry VTT"
+    assert updated["character_source"] == "D&D Beyond"
 
 
 def test_campaign_endpoints_require_authentication(tmp_path) -> None:
@@ -172,7 +209,7 @@ def test_campaign_guide_stores_canonical_vocabulary(tmp_path) -> None:
         f"/api/v1/campaigns/{campaign_id}/guide",
         headers=headers,
         json={
-            "kind": "character",
+            "kind": "npc",
             "canonical_name": "Tasha",
             "aliases": ["Iggwilv", "  Natasha  "],
             "notes": "Use the canonical spelling Tasha.",

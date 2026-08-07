@@ -40,7 +40,7 @@ campaign-worker = "campaign_manager.worker:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-campaign_manager = ["static/*.html"]
+campaign_manager = ["static/*.html", "static/assets/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
