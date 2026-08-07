@@ -333,8 +333,17 @@ class ExtractedProposal(BaseModel):
         return [*usable[:10], *usable[-10:]]
 
 
+# The hard bound on any single response. The consolidation sections between them
+# allow fewer than this, and a test holds that true: raising the assembly ceiling
+# past this cap made every consolidation fail validation, and the run fell back to
+# raw unconsolidated extraction, which reads exactly like the pipeline regressing.
+MAX_PROPOSALS_PER_RESPONSE = 60
+
+
 class AnalysisResult(BaseModel):
-    proposals: list[ExtractedProposal] = Field(default_factory=list, max_length=40)
+    proposals: list[ExtractedProposal] = Field(
+        default_factory=list, max_length=MAX_PROPOSALS_PER_RESPONSE
+    )
 
 
 Analyze = Callable[[str, str, dict[str, Any]], tuple[AnalysisResult, dict[str, Any]]]
@@ -1337,7 +1346,9 @@ def _bounded_result(proposals: list[ExtractedProposal]) -> list[ExtractedProposa
     by confidence and dropped the tail: one run lost all ten of its threads, which
     score lower than scenes and entities by nature, and nothing recorded it.
     """
-    ceiling = sum(section.maximum or 0 for section in SECTIONS)
+    ceiling = min(
+        sum(section.maximum or 0 for section in SECTIONS), MAX_PROPOSALS_PER_RESPONSE
+    )
     if len(proposals) <= ceiling:
         return proposals
     required = [p for p in proposals if p.kind in REQUIRED_KINDS]

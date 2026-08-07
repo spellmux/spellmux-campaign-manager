@@ -983,3 +983,28 @@ def test_consolidation_reports_what_each_section_dropped(tmp_path) -> None:
             + entry["dropped_over_section_limit"]
         ), name
     assert [p.kind for p in result.proposals].count("session_summary") == 1
+
+
+def test_section_limits_fit_inside_the_response_cap() -> None:
+    # Raising the assembly ceiling above what AnalysisResult validates made every
+    # consolidation throw, and the run silently fell back to raw extraction output.
+    from campaign_manager.analysis import MAX_PROPOSALS_PER_RESPONSE
+
+    assert sum(section.maximum or 0 for section in SECTIONS) <= MAX_PROPOSALS_PER_RESPONSE
+    assert AnalysisResult.model_fields["proposals"].metadata
+    assert _bounded_result([
+        ExtractedProposal.model_validate({
+            "kind": "scene", "title": f"Scene {index}", "body": "Body.", "aliases": [],
+            "confidence": 0.5, "visibility": "gm", "evidence": [],
+        })
+        for index in range(MAX_PROPOSALS_PER_RESPONSE + 20)
+    ]) != []
+    # The result of trimming must itself be a valid response.
+    trimmed = _bounded_result([
+        ExtractedProposal.model_validate({
+            "kind": "scene", "title": f"Scene {index}", "body": "Body.", "aliases": [],
+            "confidence": 0.5, "visibility": "gm", "evidence": [],
+        })
+        for index in range(MAX_PROPOSALS_PER_RESPONSE + 20)
+    ])
+    AnalysisResult(proposals=trimmed)
